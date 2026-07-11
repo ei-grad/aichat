@@ -18,7 +18,14 @@ const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
 
-pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
+pub fn eval_tool_calls(config: &GlobalConfig, calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
+    eval_tool_calls_with(calls, |call| call.eval(config))
+}
+
+fn eval_tool_calls_with<F>(mut calls: Vec<ToolCall>, mut eval: F) -> Result<Vec<ToolResult>>
+where
+    F: FnMut(&ToolCall) -> Result<Value>,
+{
     let mut output = vec![];
     if calls.is_empty() {
         return Ok(output);
@@ -29,7 +36,15 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
     }
     let mut is_all_null = true;
     for call in calls {
-        let mut result = call.eval(config)?;
+        let mut result = match eval(&call) {
+            Ok(result) => result,
+            Err(_) => json!({
+                "error": {
+                    "type": "tool_execution_error",
+                    "message": "The tool call failed. Fix its arguments or choose another tool."
+                }
+            }),
+        };
         if result.is_null() {
             result = json!("DONE");
         } else {
@@ -306,4 +321,145 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
         }
     }
     cmd_name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    fn declaration(name: &str) -> FunctionDeclaration {
+        serde_json::from_value(json!({
+            "name": name,
+            "description": "test function",
+            "parameters": { "type": "object" }
+        }))
+        .unwrap()
+    }
+
+    fn config_with_functions(names: &[&str]) -> GlobalConfig {
+        let config = Config {
+            functions: Functions {
+                declarations: names.iter().map(|name| declaration(name)).collect(),
+            },
+            ..Default::default()
+        };
+        Arc::new(RwLock::new(config))
+    }
+
+    fn assert_tool_error(result: &ToolResult, id: &str) {
+        assert_eq!(result.call.id.as_deref(), Some(id));
+        assert_eq!(
+            result.output,
+            json!({
+                "error": {
+                    "type": "tool_execution_error",
+                    "message": "The tool call failed. Fix its arguments or choose another tool."
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_tool_batch_preserves_order_ids_success_and_null_results() {
+        let calls = vec![
+            ToolCall::new("success".into(), json!({}), Some("call-1".into())),
+            ToolCall::new("null".into(), json!({}), Some("call-2".into())),
+            ToolCall::new("failure".into(), json!({}), Some("call-3".into())),
+        ];
+
+        let results = eval_tool_calls_with(calls, |call| match call.name.as_str() {
+            "success" => Ok(json!({"ok": true})),
+            "null" => Ok(Value::Null),
+            _ => bail!("private execution details"),
+        })
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].call.id.as_deref(), Some("call-1"));
+        assert_eq!(results[0].output, json!({"ok": true}));
+        assert_eq!(results[1].call.id.as_deref(), Some("call-2"));
+        assert_eq!(results[1].output, json!("DONE"));
+        assert_tool_error(&results[2], "call-3");
+        assert!(!results[2].output.to_string().contains("private"));
+    }
+
+    #[test]
+    fn all_null_tool_batch_keeps_existing_empty_result_semantics() {
+        let calls = vec![
+            ToolCall::new("null".into(), json!({}), Some("call-1".into())),
+            ToolCall::new("null".into(), json!({}), Some("call-2".into())),
+        ];
+
+        assert!(eval_tool_calls_with(calls, |_| Ok(Value::Null))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_and_invalid_arguments_become_tool_results() {
+        let unknown = eval_tool_calls(
+            &config_with_functions(&[]),
+            vec![ToolCall::new(
+                "unknown-tool".into(),
+                json!({"value": "private-unknown"}),
+                Some("unknown-id".into()),
+            )],
+        )
+        .unwrap();
+        assert_tool_error(&unknown[0], "unknown-id");
+        assert!(!unknown[0].output.to_string().contains("private-unknown"));
+
+        let invalid = eval_tool_calls(
+            &config_with_functions(&["invalid-arguments"]),
+            vec![ToolCall::new(
+                "invalid-arguments".into(),
+                json!("not JSON: private-invalid"),
+                Some("invalid-id".into()),
+            )],
+        )
+        .unwrap();
+        assert_tool_error(&invalid[0], "invalid-id");
+        assert!(!invalid[0].output.to_string().contains("private-invalid"));
+    }
+
+    #[test]
+    fn missing_executable_and_nonzero_exit_become_ordered_tool_results() {
+        let missing = "aichat-test-command-that-does-not-exist-7d7da216";
+        let nonzero = nonzero_command();
+        let config = config_with_functions(&[missing, nonzero]);
+        let results = eval_tool_calls(
+            &config,
+            vec![
+                ToolCall::new(
+                    missing.into(),
+                    json!({"value": "private-missing"}),
+                    Some("missing-id".into()),
+                ),
+                ToolCall::new(
+                    nonzero.into(),
+                    json!({"value": "private-nonzero"}),
+                    Some("nonzero-id".into()),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_tool_error(&results[0], "missing-id");
+        assert_tool_error(&results[1], "nonzero-id");
+        assert!(!results[0].output.to_string().contains("private-missing"));
+        assert!(!results[1].output.to_string().contains("private-nonzero"));
+    }
+
+    #[cfg(not(windows))]
+    fn nonzero_command() -> &'static str {
+        "false"
+    }
+
+    #[cfg(windows)]
+    fn nonzero_command() -> &'static str {
+        "where.exe"
+    }
 }
