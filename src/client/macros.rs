@@ -229,11 +229,26 @@ macro_rules! config_get_fn {
             let env_prefix = Self::name(&self.config);
             let env_name =
                 format!("{}_{}", env_prefix, stringify!($field_name)).to_ascii_uppercase();
+
+            if let Some(config_value) = self.config.$field_name.as_ref() {
+                if config_value.starts_with('$') {
+                    let env_var = config_value
+                        .trim_start_matches('$')
+                        .trim_start_matches('{')
+                        .trim_end_matches('}');
+                    return std::env::var(env_var)
+                        .map(|value| value.trim().to_string())
+                        .map_err(|_| anyhow::anyhow!("Missing ENV '{}'", env_var));
+                }
+
+                return std::env::var(&env_name)
+                    .map(|value| value.trim().to_string())
+                    .or_else(|_| Ok(config_value.clone()));
+            }
+
             std::env::var(&env_name)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .or_else(|| self.config.$field_name.clone())
-                .ok_or_else(|| anyhow::anyhow!("Miss '{}'", stringify!($field_name)))
+                .map(|value| value.trim().to_string())
+                .map_err(|_| anyhow::anyhow!("Miss '{}'", stringify!($field_name)))
         }
     };
 }
