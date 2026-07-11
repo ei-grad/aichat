@@ -40,7 +40,56 @@ enum ConfigFieldValue<'a> {
     Literal(Cow<'a, str>),
 }
 
-fn parse_config_field_value<'a>(field_name: &str, value: &'a str) -> Result<ConfigFieldValue<'a>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFieldErrorKind {
+    Absent,
+    InvalidReference,
+    UnresolvedReference,
+}
+
+#[derive(Debug)]
+pub(crate) struct ConfigFieldError {
+    field_name: String,
+    kind: ConfigFieldErrorKind,
+}
+
+impl ConfigFieldError {
+    fn new(field_name: &str, kind: ConfigFieldErrorKind) -> Self {
+        Self {
+            field_name: field_name.to_string(),
+            kind,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigFieldError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ConfigFieldErrorKind::Absent => write!(formatter, "Miss '{}'", self.field_name),
+            ConfigFieldErrorKind::InvalidReference => {
+                write!(
+                    formatter,
+                    "Invalid environment reference for '{}'",
+                    self.field_name
+                )
+            }
+            ConfigFieldErrorKind::UnresolvedReference => write!(
+                formatter,
+                "Environment variable for '{}' is missing or empty",
+                self.field_name
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigFieldError {}
+
+pub(crate) type ConfigFieldResult<T> = std::result::Result<T, ConfigFieldError>;
+
+fn parse_config_field_value<'a>(
+    field_name: &str,
+    value: &'a str,
+) -> ConfigFieldResult<ConfigFieldValue<'a>> {
     if let Some(value) = value.strip_prefix("$$") {
         return Ok(ConfigFieldValue::Literal(Cow::Owned(format!("${value}"))));
     }
@@ -54,7 +103,10 @@ fn parse_config_field_value<'a>(field_name: &str, value: &'a str) -> Result<Conf
         value.strip_prefix('$')
     };
     let Some(env_name) = env_name.filter(|name| is_valid_env_name(name)) else {
-        bail!("Invalid environment reference for '{field_name}'");
+        return Err(ConfigFieldError::new(
+            field_name,
+            ConfigFieldErrorKind::InvalidReference,
+        ));
     };
     Ok(ConfigFieldValue::Env(env_name))
 }
@@ -70,10 +122,20 @@ pub(crate) fn resolve_config_field(
     field_name: &str,
     value: Option<&str>,
     env_aliases: &[&str],
-) -> Result<String> {
+) -> ConfigFieldResult<String> {
     resolve_config_field_with(client_name, field_name, value, env_aliases, |name| {
         std::env::var(name).ok()
     })
+}
+
+pub(crate) fn optional_config_field(
+    value: ConfigFieldResult<String>,
+) -> ConfigFieldResult<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind == ConfigFieldErrorKind::Absent => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn resolve_config_field_with<F>(
@@ -82,7 +144,7 @@ fn resolve_config_field_with<F>(
     value: Option<&str>,
     env_aliases: &[&str],
     env_lookup: F,
-) -> Result<String>
+) -> ConfigFieldResult<String>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -95,7 +157,7 @@ where
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                anyhow::anyhow!("Environment variable for '{field_name}' is missing or empty")
+                ConfigFieldError::new(field_name, ConfigFieldErrorKind::UnresolvedReference)
             });
     }
 
@@ -112,7 +174,10 @@ where
     if let Some(ConfigFieldValue::Literal(value)) = value {
         return Ok(value.into_owned());
     }
-    bail!("Miss '{field_name}'")
+    Err(ConfigFieldError::new(
+        field_name,
+        ConfigFieldErrorKind::Absent,
+    ))
 }
 
 #[async_trait::async_trait]
@@ -769,7 +834,7 @@ mod tests {
         value: Option<&str>,
         aliases: &[&str],
         env: &[(&str, &str)],
-    ) -> Result<String> {
+    ) -> ConfigFieldResult<String> {
         let env: HashMap<_, _> = env
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -876,6 +941,32 @@ mod tests {
             .unwrap(),
             "literal"
         );
+    }
+
+    #[test]
+    fn optional_config_field_only_converts_true_absence() {
+        let absent = resolve_with_env("optional", "api_key", None, &[], &[]);
+        assert_eq!(optional_config_field(absent).unwrap(), None);
+
+        let literal = resolve_with_env("optional", "api_key", Some("literal"), &[], &[]);
+        assert_eq!(
+            optional_config_field(literal).unwrap(),
+            Some("literal".into())
+        );
+
+        for resolved in [
+            resolve_with_env("optional", "api_key", Some("$"), &[], &[]),
+            resolve_with_env("optional", "api_key", Some("$MISSING_KEY"), &[], &[]),
+            resolve_with_env(
+                "optional",
+                "api_key",
+                Some("$EMPTY_KEY"),
+                &[],
+                &[("EMPTY_KEY", " \r\n")],
+            ),
+        ] {
+            assert!(optional_config_field(resolved).is_err());
+        }
     }
 
     #[test]

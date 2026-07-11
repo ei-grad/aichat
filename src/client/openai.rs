@@ -45,9 +45,8 @@ fn prepare_chat_completions(
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
 
@@ -65,9 +64,8 @@ fn prepare_chat_completions(
 
 fn prepare_embeddings(self_: &OpenAIClient, data: &EmbeddingsData) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{api_base}/embeddings");
 
@@ -477,6 +475,8 @@ mod tests {
     use crate::utils::create_abort_signal;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+    const MISSING_API_BASE_ENV: &str = "AICHAT_TEST_MISSING_OPENAI_API_BASE_8CDB63A4";
+
     fn test_handler() -> (SseHandler, UnboundedReceiver<SseEvent>) {
         let (tx, rx) = unbounded_channel();
         (SseHandler::new(tx, create_abort_signal()), rx)
@@ -501,6 +501,63 @@ mod tests {
             functions: None,
             stream,
         }
+    }
+
+    fn request_client(api_base: Option<String>) -> OpenAIClient {
+        OpenAIClient {
+            global_config: Default::default(),
+            config: OpenAIConfig {
+                name: Some("openai-remediation-test".into()),
+                api_key: Some("test-key".into()),
+                api_base,
+                ..Default::default()
+            },
+            model: Model::new("openai-remediation-test", "test-model"),
+        }
+    }
+
+    fn assert_api_base_reference_error(result: Result<RequestData>) {
+        let err = result
+            .err()
+            .expect("missing explicit reference must fail before request preparation");
+        assert_eq!(
+            err.to_string(),
+            "Environment variable for 'api_base' is missing or empty"
+        );
+        assert!(!err.to_string().contains(MISSING_API_BASE_ENV));
+    }
+
+    #[test]
+    fn missing_explicit_api_base_does_not_fall_back_to_public_openai() {
+        assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
+        let client = request_client(Some(format!("${MISSING_API_BASE_ENV}")));
+
+        assert_api_base_reference_error(prepare_chat_completions(
+            &client,
+            completion_data(false),
+        ));
+        assert_api_base_reference_error(prepare_embeddings(
+            &client,
+            &EmbeddingsData::new(vec!["hello".into()], false),
+        ));
+    }
+
+    #[test]
+    fn absent_api_base_keeps_public_openai_fallbacks() {
+        let client = request_client(None);
+
+        let chat = prepare_chat_completions(&client, completion_data(false)).unwrap();
+        let embeddings = prepare_embeddings(
+            &client,
+            &EmbeddingsData::new(vec!["hello".into()], false),
+        )
+        .unwrap();
+
+        assert_eq!(chat.url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            embeddings.url,
+            "https://api.openai.com/v1/embeddings"
+        );
     }
 
     #[test]

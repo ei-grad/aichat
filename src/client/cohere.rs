@@ -43,9 +43,8 @@ fn prepare_chat_completions(
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{}/chat", api_base.trim_end_matches('/'));
     let mut body = openai_build_chat_completions_body(data, &self_.model);
@@ -64,9 +63,8 @@ fn prepare_chat_completions(
 
 fn prepare_embeddings(self_: &CohereClient, data: &EmbeddingsData) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{}/embed", api_base.trim_end_matches('/'));
 
@@ -91,9 +89,8 @@ fn prepare_embeddings(self_: &CohereClient, data: &EmbeddingsData) -> Result<Req
 
 fn prepare_rerank(self_: &CohereClient, data: &RerankData) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{}/rerank", api_base.trim_end_matches('/'));
     let body = generic_build_rerank_body(data, &self_.model);
@@ -252,4 +249,77 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         output_tokens: data["usage"]["billed_units"]["output_tokens"].as_u64(),
     };
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MISSING_API_BASE_ENV: &str = "AICHAT_TEST_MISSING_COHERE_API_BASE_04BB6F78";
+
+    fn request_client(api_base: Option<String>) -> CohereClient {
+        CohereClient {
+            global_config: Default::default(),
+            config: CohereConfig {
+                name: Some("cohere-remediation-test".into()),
+                api_key: Some("test-key".into()),
+                api_base,
+                ..Default::default()
+            },
+            model: Model::new("cohere-remediation-test", "test-model"),
+        }
+    }
+
+    fn completion_data() -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        }
+    }
+
+    fn preparation_results(client: &CohereClient) -> [Result<RequestData>; 3] {
+        [
+            prepare_chat_completions(client, completion_data()),
+            prepare_embeddings(
+                client,
+                &EmbeddingsData::new(vec!["hello".into()], false),
+            ),
+            prepare_rerank(
+                client,
+                &RerankData::new("query".into(), vec!["document".into()], 1),
+            ),
+        ]
+    }
+
+    #[test]
+    fn missing_explicit_api_base_does_not_fall_back_to_public_cohere() {
+        assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
+        let client = request_client(Some(format!("${MISSING_API_BASE_ENV}")));
+
+        for result in preparation_results(&client) {
+            let err = result
+                .err()
+                .expect("missing explicit reference must fail before request preparation");
+            assert_eq!(
+                err.to_string(),
+                "Environment variable for 'api_base' is missing or empty"
+            );
+            assert!(!err.to_string().contains(MISSING_API_BASE_ENV));
+        }
+    }
+
+    #[test]
+    fn absent_api_base_keeps_public_cohere_fallbacks() {
+        let [chat, embeddings, rerank] = preparation_results(&request_client(None));
+
+        assert_eq!(chat.unwrap().url, "https://api.cohere.ai/v2/chat");
+        assert_eq!(embeddings.unwrap().url, "https://api.cohere.ai/v2/embed");
+        assert_eq!(rerank.unwrap().url, "https://api.cohere.ai/v2/rerank");
+    }
 }

@@ -47,7 +47,7 @@ impl BedrockClient {
         let access_key_id = self.get_access_key_id()?;
         let secret_access_key = self.get_secret_access_key()?;
         let region = self.get_region()?;
-        let session_token = self.get_session_token().ok();
+        let session_token = optional_config_field(self.get_session_token())?;
         let host = format!("bedrock-runtime.{region}.amazonaws.com");
 
         let uri = if data.stream {
@@ -96,7 +96,7 @@ impl BedrockClient {
         let access_key_id = self.get_access_key_id()?;
         let secret_access_key = self.get_secret_access_key()?;
         let region = self.get_region()?;
-        let session_token = self.get_session_token().ok();
+        let session_token = optional_config_field(self.get_session_token())?;
         let host = format!("bedrock-runtime.{region}.amazonaws.com");
 
         let uri = bedrock_model_uri(self.model.real_name(), "invoke");
@@ -689,6 +689,89 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MISSING_SESSION_TOKEN_ENV: &str =
+        "AICHAT_TEST_MISSING_BEDROCK_SESSION_TOKEN_61C5210F";
+    const CONVENTIONAL_SESSION_TOKEN_ENV: &str =
+        "BEDROCK_REMEDIATION_TEST_SESSION_TOKEN";
+
+    fn request_client(session_token: Option<String>) -> BedrockClient {
+        BedrockClient {
+            global_config: Default::default(),
+            config: BedrockConfig {
+                name: Some("bedrock_remediation_test".into()),
+                access_key_id: Some("test-access-key".into()),
+                secret_access_key: Some("test-secret-key".into()),
+                region: Some("us-east-1".into()),
+                session_token,
+                models: vec![],
+                patch: None,
+                extra: None,
+            },
+            model: Model::new("bedrock_remediation_test", "test-model"),
+        }
+    }
+
+    fn completion_data() -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn missing_explicit_session_token_fails_all_request_builders() {
+        assert!(std::env::var_os(MISSING_SESSION_TOKEN_ENV).is_none());
+        let client = request_client(Some(format!("${MISSING_SESSION_TOKEN_ENV}")));
+        let http = ReqwestClient::new();
+
+        for result in [
+            client.chat_completions_builder(&http, completion_data()),
+            client.embeddings_builder(
+                &http,
+                &EmbeddingsData::new(vec!["hello".into()], false),
+            ),
+        ] {
+            let err = result
+                .expect_err("missing explicit reference must fail before request preparation");
+            assert_eq!(
+                err.to_string(),
+                "Environment variable for 'session_token' is missing or empty"
+            );
+            assert!(!err.to_string().contains(MISSING_SESSION_TOKEN_ENV));
+        }
+    }
+
+    #[test]
+    fn absent_session_token_keeps_unsigned_optional_header() {
+        assert!(std::env::var_os(CONVENTIONAL_SESSION_TOKEN_ENV).is_none());
+        let client = request_client(None);
+        let http = ReqwestClient::new();
+        let chat = client
+            .chat_completions_builder(&http, completion_data())
+            .unwrap()
+            .build()
+            .unwrap();
+        let embeddings = client
+            .embeddings_builder(
+                &http,
+                &EmbeddingsData::new(vec!["hello".into()], false),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(!chat.headers().contains_key("x-amz-security-token"));
+        assert!(!embeddings
+            .headers()
+            .contains_key("x-amz-security-token"));
+    }
 
     #[test]
     fn canonical_model_path_keeps_unreserved_ids_and_encodes_colons() {

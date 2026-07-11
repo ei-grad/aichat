@@ -43,9 +43,8 @@ fn prepare_chat_completions(
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{}/messages", api_base.trim_end_matches('/'));
     let body = claude_build_chat_completions_body(data, &self_.model)?;
@@ -390,6 +389,36 @@ mod tests {
     use crate::utils::create_abort_signal;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+    const MISSING_API_BASE_ENV: &str = "AICHAT_TEST_MISSING_CLAUDE_API_BASE_2B76B42D";
+
+    fn request_client(api_base: Option<String>) -> ClaudeClient {
+        ClaudeClient {
+            global_config: Default::default(),
+            config: ClaudeConfig {
+                name: Some("claude-remediation-test".into()),
+                api_key: Some("test-key".into()),
+                api_base,
+                models: vec![],
+                patch: None,
+                extra: None,
+            },
+            model: Model::new("claude-remediation-test", "test-model"),
+        }
+    }
+
+    fn completion_data() -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        }
+    }
+
     fn test_handler() -> (SseHandler, UnboundedReceiver<SseEvent>) {
         let (tx, rx) = unbounded_channel();
         (SseHandler::new(tx, create_abort_signal()), rx)
@@ -401,6 +430,29 @@ mod tests {
         value: Value,
     ) -> Result<bool> {
         handle_claude_stream_message(state, handler, &value.to_string())
+    }
+
+    #[test]
+    fn missing_explicit_api_base_does_not_fall_back_to_public_claude() {
+        assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
+        let client = request_client(Some(format!("${MISSING_API_BASE_ENV}")));
+
+        let err = prepare_chat_completions(&client, completion_data())
+            .err()
+            .expect("missing explicit reference must fail before request preparation");
+
+        assert_eq!(
+            err.to_string(),
+            "Environment variable for 'api_base' is missing or empty"
+        );
+        assert!(!err.to_string().contains(MISSING_API_BASE_ENV));
+    }
+
+    #[test]
+    fn absent_api_base_keeps_public_claude_fallback() {
+        let request = prepare_chat_completions(&request_client(None), completion_data()).unwrap();
+
+        assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
     }
 
     #[test]

@@ -39,7 +39,7 @@ fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+    let api_key = optional_config_field(self_.get_api_key())?;
     let api_base = get_api_base_ext(self_)?;
 
     let url = format!("{api_base}/chat/completions");
@@ -59,7 +59,7 @@ fn prepare_embeddings(
     self_: &OpenAICompatibleClient,
     data: &EmbeddingsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+    let api_key = optional_config_field(self_.get_api_key())?;
     let api_base = get_api_base_ext(self_)?;
 
     let url = format!("{api_base}/embeddings");
@@ -76,7 +76,7 @@ fn prepare_embeddings(
 }
 
 fn prepare_rerank(self_: &OpenAICompatibleClient, data: &RerankData) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+    let api_key = optional_config_field(self_.get_api_key())?;
     let api_base = get_api_base_ext(self_)?;
 
     let url = if self_.name().starts_with("ernie") {
@@ -97,22 +97,18 @@ fn prepare_rerank(self_: &OpenAICompatibleClient, data: &RerankData) -> Result<R
 }
 
 fn get_api_base_ext(self_: &OpenAICompatibleClient) -> Result<String> {
-    let api_base = match self_.get_api_base() {
-        Ok(v) => v,
-        Err(err) => {
-            match OPENAI_COMPATIBLE_PROVIDERS
-                .into_iter()
-                .find_map(|(name, api_base)| {
-                    if name == self_.model.client_name() {
-                        Some(api_base.to_string())
-                    } else {
-                        None
-                    }
-                }) {
-                Some(v) => v,
-                None => return Err(err),
-            }
-        }
+    let api_base = match optional_config_field(self_.get_api_base())? {
+        Some(api_base) => api_base,
+        None => OPENAI_COMPATIBLE_PROVIDERS
+            .into_iter()
+            .find_map(|(name, api_base)| {
+                if name == self_.model.client_name() {
+                    Some(api_base.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| anyhow::anyhow!("Miss 'api_base'"))?,
     };
     Ok(api_base.trim_end_matches('/').to_string())
 }
@@ -159,4 +155,139 @@ pub fn generic_build_rerank_body(data: &RerankData, model: &Model) -> Value {
         body["top_n"] = (*top_n).into()
     }
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MISSING_API_KEY_ENV: &str =
+        "AICHAT_TEST_MISSING_OPENAI_COMPATIBLE_API_KEY_B07D8216";
+    const MISSING_API_BASE_ENV: &str =
+        "AICHAT_TEST_MISSING_OPENAI_COMPATIBLE_API_BASE_F5813573";
+
+    fn request_client(
+        name: &str,
+        api_base: Option<String>,
+        api_key: Option<String>,
+    ) -> OpenAICompatibleClient {
+        OpenAICompatibleClient {
+            global_config: Default::default(),
+            config: OpenAICompatibleConfig {
+                name: Some(name.to_string()),
+                api_base,
+                api_key,
+                models: vec![],
+                patch: None,
+                extra: None,
+            },
+            model: Model::new(name, "test-model"),
+        }
+    }
+
+    fn completion_data() -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        }
+    }
+
+    fn preparation_results(client: &OpenAICompatibleClient) -> [Result<RequestData>; 3] {
+        [
+            prepare_chat_completions(client, completion_data()),
+            prepare_embeddings(
+                client,
+                &EmbeddingsData::new(vec!["hello".into()], false),
+            ),
+            prepare_rerank(
+                client,
+                &RerankData::new("query".into(), vec!["document".into()], 1),
+            ),
+        ]
+    }
+
+    fn assert_reference_errors(
+        results: [Result<RequestData>; 3],
+        field_name: &str,
+        env_name: &str,
+    ) {
+        for result in results {
+            let err = result
+                .err()
+                .expect("missing explicit reference must fail before request preparation");
+            assert_eq!(
+                err.to_string(),
+                format!("Environment variable for '{field_name}' is missing or empty")
+            );
+            assert!(!err.to_string().contains(env_name));
+        }
+    }
+
+    #[test]
+    fn missing_explicit_api_key_is_not_converted_to_no_auth() {
+        assert!(std::env::var_os(MISSING_API_KEY_ENV).is_none());
+        let client = request_client(
+            "openai-compatible-remediation-test",
+            Some("https://local.invalid/v1".into()),
+            Some(format!("${MISSING_API_KEY_ENV}")),
+        );
+
+        assert_reference_errors(
+            preparation_results(&client),
+            "api_key",
+            MISSING_API_KEY_ENV,
+        );
+    }
+
+    #[test]
+    fn absent_api_key_keeps_optional_no_auth_requests() {
+        let client = request_client(
+            "openai-compatible-remediation-test",
+            Some("https://local.invalid/v1".into()),
+            None,
+        );
+
+        for request in preparation_results(&client).map(Result::unwrap) {
+            assert!(!request.headers.contains_key("authorization"));
+        }
+    }
+
+    #[test]
+    fn missing_explicit_api_base_is_not_replaced_by_provider_default() {
+        assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
+        let client = request_client(
+            "openrouter",
+            Some(format!("${MISSING_API_BASE_ENV}")),
+            None,
+        );
+
+        assert_reference_errors(
+            preparation_results(&client),
+            "api_base",
+            MISSING_API_BASE_ENV,
+        );
+    }
+
+    #[test]
+    fn absent_api_base_keeps_known_provider_default() {
+        assert!(std::env::var_os("VOYAGEAI_API_BASE").is_none());
+        let [chat, embeddings, rerank] =
+            preparation_results(&request_client("voyageai", None, None));
+
+        assert_eq!(
+            chat.unwrap().url,
+            "https://api.voyageai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            embeddings.unwrap().url,
+            "https://api.voyageai.com/v1/embeddings"
+        );
+        assert_eq!(rerank.unwrap().url, "https://api.voyageai.com/v1/rerank");
+    }
 }

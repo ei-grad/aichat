@@ -42,9 +42,8 @@ fn prepare_chat_completions(
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let func = match data.stream {
         true => "streamGenerateContent",
@@ -69,9 +68,8 @@ fn prepare_chat_completions(
 
 fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<RequestData> {
     let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base =
+        optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!(
         "{}/models/{}:batchEmbedContents?key={}",
@@ -133,4 +131,80 @@ struct EmbeddingsResBody {
 #[derive(Deserialize)]
 struct EmbeddingsResBodyEmbedding {
     values: Vec<f32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MISSING_API_BASE_ENV: &str = "AICHAT_TEST_MISSING_GEMINI_API_BASE_8F65F4CE";
+
+    fn request_client(api_base: Option<String>) -> GeminiClient {
+        GeminiClient {
+            global_config: Default::default(),
+            config: GeminiConfig {
+                name: Some("gemini-remediation-test".into()),
+                api_key: Some("test-key".into()),
+                api_base,
+                ..Default::default()
+            },
+            model: Model::new("gemini-remediation-test", "test-model"),
+        }
+    }
+
+    fn completion_data() -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn missing_explicit_api_base_does_not_fall_back_to_public_gemini() {
+        assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
+        let client = request_client(Some(format!("${MISSING_API_BASE_ENV}")));
+
+        for result in [
+            prepare_chat_completions(&client, completion_data()),
+            prepare_embeddings(
+                &client,
+                &EmbeddingsData::new(vec!["hello".into()], false),
+            ),
+        ] {
+            let err = result
+                .err()
+                .expect("missing explicit reference must fail before request preparation");
+            assert_eq!(
+                err.to_string(),
+                "Environment variable for 'api_base' is missing or empty"
+            );
+            assert!(!err.to_string().contains(MISSING_API_BASE_ENV));
+        }
+    }
+
+    #[test]
+    fn absent_api_base_keeps_public_gemini_fallbacks() {
+        let client = request_client(None);
+        let chat = prepare_chat_completions(&client, completion_data()).unwrap();
+        let embeddings = prepare_embeddings(
+            &client,
+            &EmbeddingsData::new(vec!["hello".into()], false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            chat.url,
+            "https://generativelanguage.googleapis.com/v1beta/models/test-model:generateContent"
+        );
+        assert_eq!(
+            embeddings.url,
+            "https://generativelanguage.googleapis.com/v1beta/models/test-model:batchEmbedContents?key=test-key"
+        );
+    }
 }
