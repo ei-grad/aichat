@@ -13,6 +13,10 @@
   <link rel="stylesheet" href="//unpkg.com/@highlightjs/cdn-assets@11.10.0/styles/github.min.css"
     media="screen and (prefers-color-scheme: light)">
   <script src="//unpkg.com/@highlightjs/cdn-assets@11.10.0/highlight.min.js" defer></script>
+  <!-- DOMPurify 3.3.1: https://github.com/cure53/DOMPurify/releases/tag/3.3.1 -->
+  <script src="https://unpkg.com/dompurify@3.3.1/dist/purify.min.js"
+    integrity="sha384-80VlBZnyAwkkqtSfg5NhPyZff6nU4K/qniLBL8Jnm4KDv6jZhLiYtJbhglg/i9ww"
+    crossorigin="anonymous" defer></script>
   <script src="//unpkg.com/marked@15.0.3/lib/marked.umd.js" defer></script>
   <script src="//unpkg.com/katex@0.16.11/dist/katex.min.js" defer></script>
   <script src="//unpkg.com/@sigodenjs/marked-katex-extension@1.0.0/lib/index.umd.js" defer></script>
@@ -427,7 +431,7 @@
                 <div class="chat-message-content">
                   <!-- message -->
                   <template x-if="message.role == 'assistant' && message.html">
-                    <div class="markdown-body" x-html="message.html"></div>
+                    <div class="markdown-body" x-html="message.html" @click="handleMarkdownClick($event)"></div>
                   </template>
                   <template x-if="message.role == 'assistant' && message.state == 'loading'">
                     <div class="spinner"></div>
@@ -753,6 +757,13 @@
           }
         },
 
+        handleMarkdownClick(event) {
+          const $copyBtn = event.target.closest?.('.copy-code-btn');
+          if ($copyBtn) {
+            this.handleCopyCode({ target: $copyBtn });
+          }
+        },
+
         handleCopyMessage(content) {
           if (Array.isArray(content)) {
             content = content.map(v => v.text || "").join("");
@@ -1016,7 +1027,7 @@
 
           return `<div class="code-block">
         <pre><code class="hljs ${lang}">${highlighted}</code></pre>
-  <div class="copy-code-btn" @click="handleCopyCode" title="Copy code">
+  <div class="copy-code-btn" title="Copy code">
     <svg fill="currentColor" viewBox="0 0 16 16">
       <path fill-rule="evenodd" d="M4 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1h1v1a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h1v1z"/>
     </svg>
@@ -1088,8 +1099,29 @@
       return chunks;
     }
 
+    function sanitizeRenderedHtml(html) {
+      if (!globalThis.DOMPurify || typeof globalThis.DOMPurify.sanitize !== 'function') {
+        return null;
+      }
+      return globalThis.DOMPurify.sanitize(html, {
+        USE_PROFILES: { html: true, svg: true, svgFilters: true, mathMl: true },
+        ALLOW_UNKNOWN_PROTOCOLS: false,
+        ALLOW_DATA_ATTR: false,
+        SANITIZE_DOM: true,
+        SANITIZE_NAMED_PROPS: true,
+        FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form'],
+        FORBID_ATTR: ['srcdoc'],
+      });
+    }
+
     function renderMarkdown(text, error = '') {
-      return marked.marked(text) + (error ? `<pre class="error">${error}</pre>` : '');
+      if (!globalThis.marked || typeof globalThis.marked.marked !== 'function') {
+        return '';
+      }
+      const errorHtml = error
+        ? `<pre class="error">${escapeForHTML(String(error))}</pre>`
+        : '';
+      return sanitizeRenderedHtml(globalThis.marked.marked(text) + errorHtml) ?? '';
     }
 
     function calculateOffsets(pieces) {
