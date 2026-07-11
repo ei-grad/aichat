@@ -21,7 +21,7 @@ struct RolesAsset;
 fn is_front_matter_fence(line: &str) -> bool {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let line = line.strip_suffix('\r').unwrap_or(line);
-    line.trim_end_matches(|c| matches!(c, ' ' | '\t')) == "---"
+    line.trim_end_matches([' ', '\t']) == "---"
 }
 
 fn split_front_matter(content: &str) -> Option<(&str, &str)> {
@@ -492,6 +492,9 @@ Input 1
 
     #[test]
     fn test_role_prompt_trim_contract_without_front_matter() {
-        assert_eq!(Role::new("plain", " \n  prompt body  \n ").prompt(), "prompt body");
+        assert_eq!(
+            Role::new("plain", " \n  prompt body  \n ").prompt(),
+            "prompt body"
+        );
     }
 }
