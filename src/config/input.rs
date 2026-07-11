@@ -438,6 +438,114 @@ fn resolve_paths(
     ))
 }
 
+#[cfg(test)]
+mod session_regenerate_tests {
+    use super::*;
+
+    fn session_with_history() -> (GlobalConfig, Session, Input) {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let mut session = Session::new(&config.read(), "test");
+
+        let role = Role::new("test", "System instructions");
+        let mut history = Input::from_str(&config, "earlier question", Some(role));
+        history.tool_calls = Some(MessageContentToolCalls::new(
+            vec![],
+            "earlier tool result".to_string(),
+        ));
+        session.add_message(&history, "earlier answer").unwrap();
+
+        let mut current = Input::from_str(&config, "raw current question", None);
+        current.medias = vec![
+            "data:image/png;base64,first".to_string(),
+            "data:image/png;base64,second".to_string(),
+        ];
+        session.add_message(&current, "old answer").unwrap();
+
+        (config, session, current)
+    }
+
+    #[test]
+    fn regenerate_uses_refreshed_context_and_preserves_history_order() {
+        let (_config, session, current) = session_with_history();
+        let persisted_before = serde_json::to_value(&session).unwrap();
+        let mut regenerate = current.clone();
+        regenerate.patched_text = Some("question with refreshed RAG context".to_string());
+        regenerate.set_regenerate();
+
+        let messages = session.build_messages(&regenerate);
+        let roles: Vec<MessageRole> = messages.iter().map(|message| message.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Tool,
+                MessageRole::Assistant,
+                MessageRole::User,
+            ]
+        );
+
+        let MessageContent::Array(parts) = &messages.last().unwrap().content else {
+            panic!("regenerated media input must remain multipart");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(
+            &parts[0],
+            MessageContentPart::Text { text } if text == "question with refreshed RAG context"
+        ));
+        assert!(matches!(
+            &parts[1],
+            MessageContentPart::ImageUrl { image_url }
+                if image_url.url == "data:image/png;base64,first"
+        ));
+        assert!(matches!(
+            &parts[2],
+            MessageContentPart::ImageUrl { image_url }
+                if image_url.url == "data:image/png;base64,second"
+        ));
+        assert_eq!(serde_json::to_value(&session).unwrap(), persisted_before);
+    }
+
+    #[test]
+    fn regenerate_without_rag_keeps_original_user_content() {
+        let (_config, session, current) = session_with_history();
+        let persisted_before = serde_json::to_value(&session).unwrap();
+        let expected_content = serde_json::to_value(current.message_content()).unwrap();
+        let mut regenerate = current;
+        regenerate.set_regenerate();
+
+        let messages = session.build_messages(&regenerate);
+        assert_eq!(
+            serde_json::to_value(&messages.last().unwrap().content).unwrap(),
+            expected_content
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), persisted_before);
+    }
+
+    #[test]
+    fn successful_regenerate_replaces_only_the_prior_assistant() {
+        let (_config, mut session, current) = session_with_history();
+        let mut regenerate = current;
+        regenerate.patched_text = Some("question with refreshed RAG context".to_string());
+        regenerate.set_regenerate();
+
+        let persisted_before = serde_json::to_value(&session).unwrap();
+        let before_messages = persisted_before["messages"].as_array().unwrap();
+        let _outbound = session.build_messages(&regenerate);
+        assert_eq!(serde_json::to_value(&session).unwrap(), persisted_before);
+
+        session.add_message(&regenerate, "new answer").unwrap();
+        let persisted_after = serde_json::to_value(&session).unwrap();
+        let after_messages = persisted_after["messages"].as_array().unwrap();
+        assert_eq!(
+            &after_messages[..after_messages.len() - 1],
+            &before_messages[..before_messages.len() - 1]
+        );
+        assert_eq!(after_messages.last().unwrap()["role"], "assistant");
+        assert_eq!(after_messages.last().unwrap()["content"], "new answer");
+    }
+}
+
 async fn load_documents(
     loaders: &HashMap<String, String>,
     local_paths: Vec<String>,

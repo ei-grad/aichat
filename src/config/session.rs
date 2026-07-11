@@ -534,6 +534,9 @@ impl Session {
                     break;
                 }
             }
+            if let Some(message) = messages.last_mut() {
+                message.content = input.message_content();
+            }
             return messages;
         }
         let mut need_add_msg = true;
