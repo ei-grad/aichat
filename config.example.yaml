@@ -259,13 +259,19 @@ clients:
     api_base: https://api.hunyuan.cloud.tencent.com/v1
     api_key: xxx
 
-  # See https://platform.moonshot.cn/docs/intro
+  # China: https://platform.kimi.com/docs/api/overview
   - type: openai-compatible
     name: moonshot
     api_base: https://api.moonshot.cn/v1
     api_key: xxx
 
-  # See https://platform.deepseek.com/api-docs/
+  # International: https://platform.kimi.ai/docs/guide/start-using-kimi-api
+  - type: openai-compatible
+    name: moonshot_intl
+    api_base: https://api.moonshot.ai/v1
+    api_key: xxx
+
+  # See https://api-docs.deepseek.com/
   - type: openai-compatible
     name: deepseek
     api_base: https://api.deepseek.com
@@ -277,10 +283,10 @@ clients:
     api_base: https://open.bigmodel.cn/api/paas/v4
     api_key: xxx
 
-  # See https://platform.minimaxi.com/document/Fast%20access
+  # See https://platform.minimax.io/docs/api-reference/text-openai-api
   - type: openai-compatible
     name: minimax
-    api_base: https://api.minimax.chat/v1
+    api_base: https://api.minimax.io/v1
     api_key: xxx
 
   # See https://openrouter.ai/docs#quick-start

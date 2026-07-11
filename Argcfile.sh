@@ -312,14 +312,15 @@ _argc_before() {
         ai21,jamba-1.5-mini,https://api.ai21.com/studio/v1 \
         cloudflare,@cf/meta/llama-3.1-8b-instruct,https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1 \
         deepinfra,meta-llama/Meta-Llama-3.1-8B-Instruct,https://api.deepinfra.com/v1/openai \
-        deepseek,deepseek-chat,https://api.deepseek.com \
+        deepseek,deepseek-v4-flash,https://api.deepseek.com \
         ernie,ernie-4.0-turbo-8k-latest,https://qianfan.baidubce.com/v2 \
         github,gpt-4o-mini,https://models.inference.ai.azure.com \
         groq,llama-3.1-8b-instant,https://api.groq.com/openai/v1 \
         hunyuan,hunyuan-large,https://api.hunyuan.cloud.tencent.com/v1 \
-        minimax,MiniMax-Text-01,https://api.minimax.chat/v1 \
+        minimax,MiniMax-M2.7,https://api.minimax.io/v1 \
         mistral,mistral-small-latest,https://api.mistral.ai/v1 \
-        moonshot,moonshot-v1-8k,https://api.moonshot.cn/v1 \
+        moonshot,kimi-k2.6,https://api.moonshot.cn/v1 \
+        moonshot_intl,kimi-k2.7-code,https://api.moonshot.ai/v1 \
         openrouter,openai/gpt-4o-mini,https://openrouter.ai/api/v1 \
         perplexity,llama-3.1-8b-instruct,https://api.perplexity.ai \
         qianwen,qwen-turbo-latest,https://dashscope.aliyuncs.com/compatible-mode/v1 \
