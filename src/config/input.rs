@@ -9,7 +9,7 @@ use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexSet;
-use std::{collections::HashMap, fs::File, io::Read};
+use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
@@ -574,6 +574,7 @@ async fn load_documents(
     for file_path in local_files {
         if is_image(&file_path) {
             let contents = read_media_to_data_url(&file_path)
+                .await
                 .with_context(|| format!("Unable to read media '{file_path}'"))?;
             data_urls.insert(sha256(&contents), file_path);
             medias.push(contents)
@@ -628,21 +629,51 @@ fn is_image(path: &str) -> bool {
         .unwrap_or_default()
 }
 
-fn read_media_to_data_url(image_path: &str) -> Result<String> {
+async fn read_media_to_data_url(image_path: &str) -> Result<String> {
+    let buffer = tokio::fs::read(image_path)
+        .await
+        .with_context(|| format!("Failed to read media bytes from '{image_path}'"))?;
+    media_bytes_to_data_url(image_path, &buffer)
+}
+
+fn media_bytes_to_data_url(image_path: &str, buffer: &[u8]) -> Result<String> {
     let extension = get_patch_extension(image_path).unwrap_or_default();
     let mime_type = match extension.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
-        _ => bail!("Unexpected media type"),
+        _ => bail!("Unexpected media type for '{image_path}'"),
     };
-    let mut file = File::open(image_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
 
     let encoded_image = base64_encode(buffer);
     let data_url = format!("data:{mime_type};base64,{encoded_image}");
 
     Ok(data_url)
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    #[test]
+    fn media_bytes_keep_the_existing_data_url_format() {
+        let data_url = media_bytes_to_data_url("sample.png", &[0, 1, 2, 255]).unwrap();
+        assert_eq!(data_url, "data:image/png;base64,AAEC/w==");
+    }
+
+    #[test]
+    fn unsupported_media_error_includes_the_path() {
+        let error = media_bytes_to_data_url("sample.bmp", &[1, 2, 3]).unwrap_err();
+        assert_eq!(error.to_string(), "Unexpected media type for 'sample.bmp'");
+    }
+
+    #[tokio::test]
+    async fn async_media_read_error_includes_the_path() {
+        let path =
+            std::env::temp_dir().join(format!("aichat-missing-media-{}.png", std::process::id()));
+        let path = path.to_string_lossy();
+        let error = read_media_to_data_url(&path).await.unwrap_err();
+        assert!(error.to_string().contains(path.as_ref()));
+    }
 }
