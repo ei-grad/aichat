@@ -167,7 +167,7 @@ where
             Some((v, score))
         })
         .collect();
-    list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    list.sort_unstable_by_key(|item| std::cmp::Reverse(item.1));
     list.into_iter().map(|(v, _)| v).collect()
 }
 
