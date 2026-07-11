@@ -122,6 +122,11 @@
       max_output_tokens: 8192
       input_price: 0
       output_price: 0
+    - name: gemini-3-flash-preview
+      type: chat
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      supports_vision: true
 
 # Links:
 #  - https://platform.claude.com/docs/en/about-claude/models/overview
@@ -275,6 +280,46 @@
           thinking:
             type: enabled
             budget_tokens: 16000
+    - name: claude-opus-4-8
+      type: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: claude-opus-4-8:thinking
+      type: chat
+      real_name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          thinking:
+            type: adaptive
+    - name: claude-sonnet-5
+      type: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
 
 # Links:
 #  - https://docs.mistral.ai/getting-started/models/models_overview/
@@ -705,6 +750,47 @@
       max_tokens_per_chunk: 2048
       default_chunk_size: 1500
       max_batch_size: 5
+    - name: gemini-3-flash-preview
+      type: chat
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.5
+      output_price: 3
+      supports_vision: true
+    - name: claude-opus-4-8
+      type: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: claude-opus-4-8:thinking
+      type: chat
+      real_name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          thinking:
+            type: adaptive
+    - name: claude-sonnet-5
+      type: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
 
 # Links:
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html#model-ids-arns
