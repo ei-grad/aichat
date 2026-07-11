@@ -94,6 +94,31 @@ pub async fn sse_stream<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
 where
     F: FnMut(SseMmessage) -> Result<bool>,
 {
+    sse_stream_inner(builder, &mut handle, catch_error, false).await
+}
+
+pub(crate) async fn sse_stream_sanitized<F, E>(
+    builder: RequestBuilder,
+    mut handle: F,
+    handle_error: E,
+) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+    E: Fn(&Value, u16) -> Result<()>,
+{
+    sse_stream_inner(builder, &mut handle, handle_error, true).await
+}
+
+async fn sse_stream_inner<F, E>(
+    builder: RequestBuilder,
+    handle: &mut F,
+    handle_error: E,
+    sanitize_transport_errors: bool,
+) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+    E: Fn(&Value, u16) -> Result<()>,
+{
     let mut es = builder.eventsource()?;
     while let Some(event) = es.next().await {
         match event {
@@ -117,6 +142,9 @@ where
                         let text = res.text().await?;
                         let data: Value = match text.parse() {
                             Ok(data) => data,
+                            Err(_) if sanitize_transport_errors => {
+                                bail!("Streaming request failed (status: {})", status.as_u16());
+                            }
                             Err(_) => {
                                 bail!(
                                     "Invalid response data: {text} (status: {})",
@@ -124,13 +152,20 @@ where
                                 );
                             }
                         };
-                        catch_error(&data, status.as_u16())?;
+                        handle_error(&data, status.as_u16())?;
                     }
                     EventSourceError::InvalidContentType(header_value, res) => {
+                        let status = res.status().as_u16();
+                        let content_type = header_value.to_str().unwrap_or_default();
+                        if sanitize_transport_errors {
+                            bail!(
+                                "Invalid response event-stream (status: {status}, content-type: {content_type})"
+                            );
+                        }
                         let text = res.text().await?;
                         bail!(
                             "Invalid response event-stream. content-type: {}, data: {text}",
-                            header_value.to_str().unwrap_or_default()
+                            content_type
                         );
                     }
                     _ => {
@@ -146,6 +181,15 @@ where
 
 #[cfg(test)]
 pub(crate) async fn sse_fixture_builder(body: &str) -> Result<RequestBuilder> {
+    response_fixture_builder("200 OK", "text/event-stream", body).await
+}
+
+#[cfg(test)]
+pub(crate) async fn response_fixture_builder(
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<RequestBuilder> {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -154,7 +198,7 @@ pub(crate) async fn sse_fixture_builder(body: &str) -> Result<RequestBuilder> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     tokio::spawn(async move {

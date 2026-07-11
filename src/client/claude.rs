@@ -63,9 +63,15 @@ pub async fn claude_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = match res.json().await {
+        Ok(data) => data,
+        Err(_) if !status.is_success() => {
+            bail!("Claude request failed (status: {})", status.as_u16());
+        }
+        Err(err) => return Err(err.into()),
+    };
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_claude_error(&data, status.as_u16())?;
     }
     let output = claude_extract_chat_completions(&data)?;
     debug!("non-stream-data: {data}");
@@ -74,17 +80,48 @@ pub async fn claude_chat_completions(
 
 #[derive(Debug, Default)]
 struct ClaudeStreamState {
-    tool_call: Option<PendingClaudeToolCall>,
+    active_block: Option<ClaudeContentBlock>,
     completed_tool_calls: Vec<ToolCall>,
     output: String,
-    reasoning: bool,
     terminal_stop_reason: Option<String>,
 }
 
 impl ClaudeStreamState {
-    fn finish_tool_call(&mut self) -> Result<()> {
-        if let Some(tool_call) = self.tool_call.take() {
-            self.completed_tool_calls.push(tool_call.into_tool_call()?);
+    fn start_block(&mut self, block: ClaudeContentBlock) -> Result<()> {
+        if let Some(active) = self.active_block.as_ref() {
+            bail!(
+                "Claude started {} block {} before {} block {} stopped",
+                block.kind(),
+                block.index(),
+                active.kind(),
+                active.index()
+            );
+        }
+        self.active_block = Some(block);
+        Ok(())
+    }
+
+    fn finish_block(&mut self, index: u64) -> Result<()> {
+        let active = self
+            .active_block
+            .take()
+            .context("Claude content_block_stop arrived without an active content block")?;
+        if active.index() != index {
+            bail!(
+                "Claude {} block {} stopped by block {index}",
+                active.kind(),
+                active.index()
+            );
+        }
+        match active {
+            ClaudeContentBlock::Thinking { emitted: true, .. } => {
+                self.output.push_str("\n</think>\n\n");
+            }
+            ClaudeContentBlock::ToolUse(tool_call) => {
+                self.completed_tool_calls
+                    .push(tool_call.into_tool_call()?);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -100,20 +137,85 @@ impl ClaudeStreamState {
     }
 
     fn finish_message(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if let Some(active) = self.active_block.as_ref() {
+            bail!(
+                "Claude message_stop arrived before {} content block {} stopped",
+                active.kind(),
+                active.index()
+            );
+        }
         if self.terminal_stop_reason.is_none() {
             bail!("Claude message_stop arrived before a terminal stop_reason");
-        }
-        if self.tool_call.is_some() {
-            bail!("Claude message_stop arrived before tool_use content_block_stop");
-        }
-        if self.reasoning {
-            bail!("Claude message_stop arrived before reasoning content_block_stop");
         }
         handler.text(&std::mem::take(&mut self.output))?;
         for tool_call in std::mem::take(&mut self.completed_tool_calls) {
             handler.tool_call(tool_call)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum ClaudeContentBlock {
+    Text { index: u64 },
+    Thinking { index: u64, emitted: bool },
+    ToolUse(PendingClaudeToolCall),
+    Unknown { index: u64 },
+}
+
+impl ClaudeContentBlock {
+    fn index(&self) -> u64 {
+        match self {
+            Self::Text { index }
+            | Self::Thinking { index, .. }
+            | Self::Unknown { index } => *index,
+            Self::ToolUse(tool_call) => tool_call.index,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Thinking { .. } => "thinking",
+            Self::ToolUse(_) => "tool_use",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeDeltaKind {
+    Text,
+    Thinking,
+    Signature,
+    ToolJson,
+    Unknown,
+}
+
+impl ClaudeDeltaKind {
+    fn from_data(data: &Value) -> Self {
+        match data["delta"]["type"].as_str() {
+            Some("text_delta") => Self::Text,
+            Some("thinking_delta") => Self::Thinking,
+            Some("signature_delta") => Self::Signature,
+            Some("input_json_delta") => Self::ToolJson,
+            Some(_) => Self::Unknown,
+            None if data["delta"]["text"].is_string() => Self::Text,
+            None if data["delta"]["thinking"].is_string() => Self::Thinking,
+            None if data["delta"]["signature"].is_string() => Self::Signature,
+            None if data["delta"]["partial_json"].is_string() => Self::ToolJson,
+            None => Self::Unknown,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Thinking => "thinking",
+            Self::Signature => "signature",
+            Self::ToolJson => "input_json",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
@@ -156,6 +258,21 @@ fn vertex_block_reason(data: &Value) -> Option<&str> {
     data["promptFeedback"]["blockReason"].as_str()
 }
 
+fn catch_claude_error(data: &Value, status: u16) -> Result<()> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    if let Some(error) = data["error"].as_object() {
+        if let Some(error_type) = error.get("type").and_then(Value::as_str) {
+            bail!("Claude request failed (status: {status}, type: {error_type})");
+        }
+        if let Some(error_code) = error.get("code").and_then(Value::as_str) {
+            bail!("Claude request failed (status: {status}, code: {error_code})");
+        }
+    }
+    bail!("Claude request failed (status: {status})");
+}
+
 fn check_claude_response(data: &Value) -> Result<()> {
     if let Some(reason) = vertex_block_reason(data) {
         bail!("Vertex AI blocked the request (reason: {reason})");
@@ -196,70 +313,98 @@ fn handle_claude_stream_message(
 
     match typ {
         "content_block_start" => {
-            if data["content_block"]["type"].as_str() == Some("fallback") {
+            let block_type = data["content_block"]["type"]
+                .as_str()
+                .context("Claude content_block_start is missing a block type")?;
+            if block_type == "fallback" {
                 bail!("Claude server-side fallback responses are not supported");
             }
-            if let (Some("tool_use"), Some(name), Some(id)) = (
-                data["content_block"]["type"].as_str(),
-                data["content_block"]["name"].as_str(),
-                data["content_block"]["id"].as_str(),
-            ) {
-                if state.tool_call.is_some() {
-                    bail!("Claude started a new tool_use before content_block_stop");
-                }
-                let index = data["index"]
-                    .as_u64()
-                    .context("Claude tool_use content_block_start is missing an index")?;
-                state.tool_call = Some(PendingClaudeToolCall {
+            let index = data["index"]
+                .as_u64()
+                .context("Claude content_block_start is missing an index")?;
+            let block = match block_type {
+                "text" => ClaudeContentBlock::Text { index },
+                "thinking" => ClaudeContentBlock::Thinking {
+                    index,
+                    emitted: false,
+                },
+                "tool_use" => {
+                    let name = data["content_block"]["name"]
+                        .as_str()
+                        .context("Claude tool_use content block is malformed")?;
+                    let id = data["content_block"]["id"]
+                        .as_str()
+                        .context("Claude tool_use content block is malformed")?;
+                    ClaudeContentBlock::ToolUse(PendingClaudeToolCall {
                     index,
                     id: id.to_string(),
                     name: name.to_string(),
                     arguments: String::new(),
-                });
-            }
+                    })
+                }
+                _ => ClaudeContentBlock::Unknown { index },
+            };
+            state.start_block(block)?;
         }
         "content_block_delta" => {
-            if let Some(text) = data["delta"]["text"].as_str() {
-                state.output.push_str(text);
-            } else if let Some(text) = data["delta"]["thinking"].as_str() {
-                if !state.reasoning {
-                    state.output.push_str("<think>\n");
-                    state.reasoning = true;
+            let index = data["index"]
+                .as_u64()
+                .context("Claude content_block_delta is missing an index")?;
+            let delta_kind = ClaudeDeltaKind::from_data(&data);
+            let active = state
+                .active_block
+                .as_mut()
+                .context("Claude content_block_delta arrived without an active content block")?;
+            if active.index() != index {
+                bail!(
+                    "Claude {} block {} received a delta for block {index}",
+                    active.kind(),
+                    active.index()
+                );
+            }
+            match (active, delta_kind) {
+                (ClaudeContentBlock::Text { .. }, ClaudeDeltaKind::Text) => {
+                    let text = data["delta"]["text"]
+                        .as_str()
+                        .context("Claude text delta is malformed")?;
+                    state.output.push_str(text);
                 }
-                state.output.push_str(text);
-            } else if let (Some(tool_call), Some(partial_json)) = (
-                state.tool_call.as_mut(),
-                data["delta"]["partial_json"].as_str(),
-            ) {
-                let index = data["index"]
-                    .as_u64()
-                    .context("Claude tool_use content_block_delta is missing an index")?;
-                if tool_call.index != index {
+                (
+                    ClaudeContentBlock::Thinking { emitted, .. },
+                    ClaudeDeltaKind::Thinking,
+                ) => {
+                    let text = data["delta"]["thinking"]
+                        .as_str()
+                        .context("Claude thinking delta is malformed")?;
+                    if !*emitted {
+                        state.output.push_str("<think>\n");
+                        *emitted = true;
+                    }
+                    state.output.push_str(text);
+                }
+                (ClaudeContentBlock::Thinking { .. }, ClaudeDeltaKind::Signature) => {}
+                (ClaudeContentBlock::ToolUse(tool_call), ClaudeDeltaKind::ToolJson) => {
+                    let partial_json = data["delta"]["partial_json"]
+                        .as_str()
+                        .context("Claude input_json delta is malformed")?;
+                    tool_call.arguments.push_str(partial_json);
+                }
+                (ClaudeContentBlock::Unknown { .. }, _) | (_, ClaudeDeltaKind::Unknown) => {}
+                (active, delta_kind) => {
                     bail!(
-                        "Claude tool_use block {} received delta for block {index}",
-                        tool_call.index
+                        "Claude {} delta does not match active {} block {}",
+                        delta_kind.name(),
+                        active.kind(),
+                        active.index()
                     );
                 }
-                tool_call.arguments.push_str(partial_json);
             }
         }
         "content_block_stop" => {
-            if state.reasoning {
-                state.output.push_str("\n</think>\n\n");
-                state.reasoning = false;
-            }
-            if let Some(tool_call) = state.tool_call.as_ref() {
-                let index = data["index"]
-                    .as_u64()
-                    .context("Claude tool_use content_block_stop is missing an index")?;
-                if tool_call.index != index {
-                    bail!(
-                        "Claude tool_use block {} stopped by block {index}",
-                        tool_call.index
-                    );
-                }
-            }
-            state.finish_tool_call()?;
+            let index = data["index"]
+                .as_u64()
+                .context("Claude content_block_stop is missing an index")?;
+            state.finish_block(index)?;
         }
         "message_delta" => {
             if let Some(stop_reason) = data["delta"].get("stop_reason") {
@@ -281,10 +426,7 @@ fn handle_claude_stream_message(
         }
         "error" => {
             let error_type = data["error"]["type"].as_str().unwrap_or("unknown_error");
-            let message = data["error"]["message"]
-                .as_str()
-                .unwrap_or("Claude streaming request failed");
-            bail!("{message} (type: {error_type})");
+            bail!("Claude streaming request failed (type: {error_type})");
         }
         _ => {}
     }
@@ -297,9 +439,13 @@ pub async fn claude_chat_completions_streaming(
     _model: &Model,
 ) -> Result<()> {
     let mut state = ClaudeStreamState::default();
-    sse_stream(builder, |message: SseMmessage| {
-        handle_claude_stream_message(&mut state, handler, &message.event, &message.data)
-    })
+    sse_stream_sanitized(
+        builder,
+        |message: SseMmessage| {
+            handle_claude_stream_message(&mut state, handler, &message.event, &message.data)
+        },
+        catch_claude_error,
+    )
     .await
 }
 
@@ -457,30 +603,35 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         for item in list {
             match item["type"].as_str() {
                 Some("thinking") => {
-                    if let Some(v) = item["thinking"].as_str() {
-                        reasoning = Some(v.to_string());
-                    }
+                    let value = item["thinking"]
+                        .as_str()
+                        .context("Claude thinking content block is malformed")?;
+                    reasoning = Some(value.to_string());
                 }
                 Some("text") => {
-                    if let Some(v) = item["text"].as_str() {
-                        if !text.is_empty() {
-                            text.push_str("\n\n");
-                        }
-                        text.push_str(v);
+                    let value = item["text"]
+                        .as_str()
+                        .context("Claude text content block is malformed")?;
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
                     }
+                    text.push_str(value);
                 }
                 Some("tool_use") => {
-                    if let (Some(name), Some(input), Some(id)) = (
-                        item["name"].as_str(),
-                        item.get("input"),
-                        item["id"].as_str(),
-                    ) {
-                        tool_calls.push(ToolCall::new(
-                            name.to_string(),
-                            input.clone(),
-                            Some(id.to_string()),
-                        ));
-                    }
+                    let name = item["name"]
+                        .as_str()
+                        .context("Claude tool_use content block is malformed")?;
+                    let input = item
+                        .get("input")
+                        .context("Claude tool_use content block is malformed")?;
+                    let id = item["id"]
+                        .as_str()
+                        .context("Claude tool_use content block is malformed")?;
+                    tool_calls.push(ToolCall::new(
+                        name.to_string(),
+                        input.clone(),
+                        Some(id.to_string()),
+                    ));
                 }
                 _ => {}
             }
@@ -491,7 +642,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     }
 
     if text.is_empty() && tool_calls.is_empty() {
-        bail!("Invalid response data: {data}");
+        bail!("Claude response did not contain supported content");
     }
 
     let output = ChatCompletionsOutput {
@@ -666,6 +817,55 @@ mod tests {
     }
 
     #[test]
+    fn malformed_nonstream_tool_block_does_not_expose_provider_payload() {
+        const TOOL_SENTINEL: &str = "NONSTREAM_TOOL_NAME_SENTINEL";
+        const INPUT_SENTINEL: &str = "NONSTREAM_TOOL_INPUT_SENTINEL";
+        let err = claude_extract_chat_completions(&json!({
+            "stop_reason": "tool_use",
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_SENTINEL,
+                "input": {"secret": INPUT_SENTINEL}
+            }]
+        }))
+        .expect_err("tool_use without an id must fail as a malformed shape");
+
+        assert_eq!(
+            err.to_string(),
+            "Claude tool_use content block is malformed"
+        );
+        assert!(!err.to_string().contains(TOOL_SENTINEL));
+        assert!(!err.to_string().contains(INPUT_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn nonstream_http_error_exposes_only_status_and_type() -> Result<()> {
+        const BODY_SENTINEL: &str = "NONSTREAM_HTTP_BODY_SENTINEL";
+        let body = json!({
+            "error": {
+                "type": "overloaded_error",
+                "message": BODY_SENTINEL
+            }
+        })
+        .to_string();
+        let builder = response_fixture_builder("529 Overloaded", "application/json", &body).await?;
+
+        let err = claude_chat_completions(
+            builder,
+            &Model::new("claude", "test-model"),
+        )
+        .await
+        .expect_err("non-success Claude HTTP response must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Claude request failed (status: 529, type: overloaded_error)"
+        );
+        assert!(!err.to_string().contains(BODY_SENTINEL));
+        Ok(())
+    }
+
+    #[test]
     fn streaming_error_is_readable_and_does_not_dispatch_partial_output() -> Result<()> {
         let (mut handler, mut rx) = test_handler();
         let mut state = ClaudeStreamState::default();
@@ -673,7 +873,21 @@ mod tests {
         handle_value(
             &mut state,
             &mut handler,
-            json!({"type":"content_block_delta","delta":{"text":"staged answer"}}),
+            json!({
+                "type":"content_block_start",
+                "index":10,
+                "content_block":{"type":"text","text":""}
+            }),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","index":10,"delta":{"type":"text_delta","text":"staged answer"}}),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_stop","index":10}),
         )?;
         handle_value(
             &mut state,
@@ -694,12 +908,16 @@ mod tests {
             &mut handler,
             json!({
                 "type":"error",
-                "error":{"type":"overloaded_error","message":"Overloaded"}
+                "error":{"type":"overloaded_error","message":"STREAM_ERROR_SENTINEL"}
             }),
         )
         .expect_err("provider error must stop the stream");
 
-        assert_eq!(err.to_string(), "Overloaded (type: overloaded_error)");
+        assert_eq!(
+            err.to_string(),
+            "Claude streaming request failed (type: overloaded_error)"
+        );
+        assert!(!err.to_string().contains("STREAM_ERROR_SENTINEL"));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -741,15 +959,26 @@ mod tests {
         let mut state = ClaudeStreamState::default();
 
         for value in [
-            json!({"type":"content_block_delta","index":0,"delta":{"thinking":"private reasoning"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":""}
+            }),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}),
             json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_delta","index":1,"delta":{"text":"partial answer"}}),
+            json!({
+                "type":"content_block_start",
+                "index":1,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"partial answer"}}),
+            json!({"type":"content_block_stop","index":1}),
             json!({
                 "type":"content_block_start",
                 "index":2,
                 "content_block":{"type":"tool_use","id":"tool-complete","name":"side_effect"}
             }),
-            json!({"type":"content_block_delta","index":2,"delta":{"partial_json":"{\"value\":1}"}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"value\":1}"}}),
             json!({"type":"content_block_stop","index":2}),
         ] {
             handle_value(&mut state, &mut handler, value)?;
@@ -842,7 +1071,16 @@ mod tests {
         handle_value(
             &mut state,
             &mut handler,
-            json!({"type":"content_block_delta","delta":{"text":"staged answer"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"staged answer"}}),
         )?;
         let err = handle_claude_stream_message(
             &mut state,
@@ -869,7 +1107,13 @@ mod tests {
         let mut state = ClaudeStreamState::default();
 
         for value in [
-            json!({"type":"content_block_delta","delta":{"text":"staged answer"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"staged answer"}}),
+            json!({"type":"content_block_stop","index":0}),
             json!({
                 "type":"content_block_start",
                 "index":4,
@@ -878,7 +1122,7 @@ mod tests {
             json!({
                 "type":"content_block_delta",
                 "index":4,
-                "delta":{"partial_json":"{\"secret\":\"must not escape\""}
+                "delta":{"type":"input_json_delta","partial_json":"{\"secret\":\"must not escape\""}
             }),
         ] {
             handle_value(&mut state, &mut handler, value)?;
@@ -914,7 +1158,16 @@ mod tests {
         handle_value(
             &mut state,
             &mut handler,
-            json!({"type":"content_block_delta","delta":{"text":"pre-fallback partial"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre-fallback partial"}}),
         )?;
         let err = handle_value(
             &mut state,
@@ -949,7 +1202,16 @@ mod tests {
         handle_value(
             &mut state,
             &mut handler,
-            json!({"type":"content_block_delta","delta":{"text":"blocked partial"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"blocked partial"}}),
         )?;
         let err = handle_event_value(
             &mut state,
@@ -981,7 +1243,16 @@ mod tests {
         handle_value(
             &mut state,
             &mut handler,
-            json!({"type":"content_block_delta","delta":{"text":"blocked partial"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"blocked partial"}}),
         )?;
         let err = handle_claude_stream_message(
             &mut state,
@@ -992,6 +1263,193 @@ mod tests {
         .expect_err("the SSE event name itself identifies a Vertex block");
 
         assert_eq!(err.to_string(), "Vertex AI blocked the request");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_message_does_not_commit_an_unstopped_text_block() -> Result<()> {
+        let (mut handler, mut rx) = test_handler();
+        let mut state = ClaudeStreamState::default();
+
+        for value in [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"text_delta","text":"truncated partial"}
+            }),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        ] {
+            handle_value(&mut state, &mut handler, value)?;
+        }
+        let err = handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"message_stop"}),
+        )
+        .expect_err("message_stop must not commit an active text block");
+
+        assert_eq!(
+            err.to_string(),
+            "Claude message_stop arrived before text content block 0 stopped"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_content_block_stop_discards_staged_text() -> Result<()> {
+        let (mut handler, mut rx) = test_handler();
+        let mut state = ClaudeStreamState::default();
+
+        for value in [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"text_delta","text":"mismatched partial"}
+            }),
+        ] {
+            handle_value(&mut state, &mut handler, value)?;
+        }
+        let err = handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_stop","index":1}),
+        )
+        .expect_err("a different block index must not close the active text block");
+
+        assert_eq!(err.to_string(), "Claude text block 0 stopped by block 1");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn recognized_content_blocks_reject_overlap_and_delta_kind_mismatch() -> Result<()> {
+        for invalid_event in [
+            json!({
+                "type":"content_block_start",
+                "index":1,
+                "content_block":{"type":"thinking","thinking":"","signature":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"thinking_delta","thinking":"wrong kind"}
+            }),
+        ] {
+            let (mut handler, mut rx) = test_handler();
+            let mut state = ClaudeStreamState::default();
+            handle_value(
+                &mut state,
+                &mut handler,
+                json!({
+                    "type":"content_block_start",
+                    "index":0,
+                    "content_block":{"type":"text","text":""}
+                }),
+            )?;
+
+            handle_value(&mut state, &mut handler, invalid_event)
+                .expect_err("recognized content-block lifecycle mismatch must fail");
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let (text, calls) = handler.take();
+            assert!(text.is_empty());
+            assert!(calls.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_http_error_exposes_only_status_and_type() -> Result<()> {
+        const BODY_SENTINEL: &str = "STREAM_HTTP_BODY_SENTINEL";
+        let body = json!({
+            "error": {
+                "type": "overloaded_error",
+                "message": BODY_SENTINEL
+            }
+        })
+        .to_string();
+        let builder = response_fixture_builder("529 Overloaded", "application/json", &body).await?;
+        let (mut handler, mut rx) = test_handler();
+
+        let err = claude_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("claude", "test-model"),
+        )
+        .await
+        .expect_err("non-success Claude SSE response must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Claude request failed (status: 529, type: overloaded_error)"
+        );
+        assert!(!err.to_string().contains(BODY_SENTINEL));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_sse_content_type_does_not_expose_body() -> Result<()> {
+        const BODY_SENTINEL: &str = "INVALID_CONTENT_TYPE_BODY_SENTINEL";
+        let builder = response_fixture_builder(
+            "200 OK",
+            "application/json",
+            BODY_SENTINEL,
+        )
+        .await?;
+        let (mut handler, mut rx) = test_handler();
+
+        let err = claude_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("claude", "test-model"),
+        )
+        .await
+        .expect_err("Claude SSE response with a non-event-stream type must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid response event-stream (status: 200, content-type: application/json)"
+        );
+        assert!(!err.to_string().contains(BODY_SENTINEL));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1081,12 +1539,23 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_sse_does_not_dispatch_staged_text() -> Result<()> {
-        let text_delta = json!({
-            "type":"content_block_delta",
-            "index":0,
-            "delta":{"text":"never externally visible"}
-        });
-        let builder = sse_fixture_builder(&format!("data: {text_delta}\n\n")).await?;
+        let events = [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"text_delta","text":"never externally visible"}
+            }),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let builder = sse_fixture_builder(&body).await?;
         let (mut handler, mut rx) = test_handler();
 
         let err = claude_chat_completions_streaming(
@@ -1113,12 +1582,21 @@ mod tests {
         let (mut handler, mut rx) = test_handler();
         let mut state = ClaudeStreamState::default();
 
-        handle_value(
-            &mut state,
-            &mut handler,
-            json!({"type":"content_block_delta","delta":{"text":"staged answer"}}),
-        )
-        .unwrap();
+        for value in [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"text_delta","text":"staged answer"}
+            }),
+            json!({"type":"content_block_stop","index":0}),
+        ] {
+            handle_value(&mut state, &mut handler, value).unwrap();
+        }
         let err = handle_value(
             &mut state,
             &mut handler,
@@ -1184,22 +1662,41 @@ mod tests {
         let mut state = ClaudeStreamState::default();
 
         for value in [
-            json!({"type":"content_block_delta","delta":{"thinking":"reason"}}),
-            json!({"type":"content_block_stop"}),
-            json!({"type":"content_block_delta","delta":{"text":"answer"}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"thinking_delta","thinking":"reason"}
+            }),
+            json!({"type":"content_block_stop","index":0}),
             json!({
                 "type":"content_block_start",
                 "index":1,
-                "content_block":{"type":"tool_use","id":"tool_one","name":"first"}
+                "content_block":{"type":"text","text":""}
             }),
-            json!({"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"value\":1}"}}),
+            json!({
+                "type":"content_block_delta",
+                "index":1,
+                "delta":{"type":"text_delta","text":"answer"}
+            }),
             json!({"type":"content_block_stop","index":1}),
             json!({
                 "type":"content_block_start",
                 "index":2,
+                "content_block":{"type":"tool_use","id":"tool_one","name":"first"}
+            }),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"value\":1}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({
+                "type":"content_block_start",
+                "index":3,
                 "content_block":{"type":"tool_use","id":"tool_two","name":"second"}
             }),
-            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_stop","index":3}),
         ] {
             handle_value(&mut state, &mut handler, value)?;
         }
