@@ -247,8 +247,20 @@ macro_rules! config_get_fn {
             }
 
             std::env::var(&env_name)
+                .ok()
                 .map(|value| value.trim().to_string())
-                .map_err(|_| anyhow::anyhow!("Miss '{}'", stringify!($field_name)))
+                .or_else(|| {
+                    if env_prefix.contains("claude") {
+                        let alt_env_name =
+                            format!("ANTHROPIC_{}", stringify!($field_name)).to_ascii_uppercase();
+                        std::env::var(&alt_env_name)
+                            .ok()
+                            .map(|value| value.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("Miss '{}'", stringify!($field_name)))
         }
     };
 }
