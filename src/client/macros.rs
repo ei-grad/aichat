@@ -225,42 +225,17 @@ macro_rules! impl_client_trait {
 #[macro_export]
 macro_rules! config_get_fn {
     ($field_name:ident, $fn_name:ident) => {
+        $crate::config_get_fn!($field_name, $fn_name, []);
+    };
+    ($field_name:ident, $fn_name:ident, [$($env_alias:literal),* $(,)?]) => {
         fn $fn_name(&self) -> anyhow::Result<String> {
             let env_prefix = Self::name(&self.config);
-            let env_name =
-                format!("{}_{}", env_prefix, stringify!($field_name)).to_ascii_uppercase();
-
-            if let Some(config_value) = self.config.$field_name.as_ref() {
-                if config_value.starts_with('$') {
-                    let env_var = config_value
-                        .trim_start_matches('$')
-                        .trim_start_matches('{')
-                        .trim_end_matches('}');
-                    return std::env::var(env_var)
-                        .map(|value| value.trim().to_string())
-                        .map_err(|_| anyhow::anyhow!("Missing ENV '{}'", env_var));
-                }
-
-                return std::env::var(&env_name)
-                    .map(|value| value.trim().to_string())
-                    .or_else(|_| Ok(config_value.clone()));
-            }
-
-            std::env::var(&env_name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .or_else(|| {
-                    if env_prefix.contains("claude") {
-                        let alt_env_name =
-                            format!("ANTHROPIC_{}", stringify!($field_name)).to_ascii_uppercase();
-                        std::env::var(&alt_env_name)
-                            .ok()
-                            .map(|value| value.trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow::anyhow!("Miss '{}'", stringify!($field_name)))
+            $crate::client::resolve_config_field(
+                env_prefix,
+                stringify!($field_name),
+                self.config.$field_name.as_deref(),
+                &[$($env_alias),*],
+            )
         }
     };
 }
