@@ -131,6 +131,7 @@
 # Links:
 #  - https://platform.claude.com/docs/en/about-claude/models/overview
 #  - https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+#  - https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback
 - provider: claude
   models:
     - name: claude-opus-4-7
@@ -315,6 +316,18 @@
       require_max_tokens: true
       input_price: 2
       output_price: 10
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: claude-fable-5
+      type: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
       supports_vision: true
       patch:
         body:
@@ -782,6 +795,16 @@
           thinking:
             type: adaptive
     - name: claude-sonnet-5
+      type: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: claude-fable-5
       type: chat
       max_input_tokens: 1000000
       max_output_tokens: 128000
