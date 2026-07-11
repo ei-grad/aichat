@@ -67,8 +67,9 @@ pub async fn claude_chat_completions(
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }
+    let output = claude_extract_chat_completions(&data)?;
     debug!("non-stream-data: {data}");
-    claude_extract_chat_completions(&data)
+    Ok(output)
 }
 
 #[derive(Debug, Default)]
@@ -129,12 +130,9 @@ impl PendingClaudeToolCall {
         let arguments = if self.arguments.is_empty() {
             json!({})
         } else {
-            self.arguments.parse().with_context(|| {
-                format!(
-                    "Tool call '{}' has non-JSON arguments '{}'",
-                    self.name, self.arguments
-                )
-            })?
+            self.arguments
+                .parse()
+                .context("Claude tool call has invalid JSON arguments")?
         };
         Ok(ToolCall::new(self.name, arguments, Some(self.id)))
     }
@@ -180,13 +178,17 @@ fn handle_claude_stream_message(
     event: &str,
     message: &str,
 ) -> Result<bool> {
+    if event == "vertex-block-event" {
+        if let Ok(data) = serde_json::from_str::<Value>(message) {
+            if let Some(reason) = vertex_block_reason(&data) {
+                bail!("Vertex AI blocked the request (reason: {reason})");
+            }
+        }
+        bail!("Vertex AI blocked the request");
+    }
     let data: Value = serde_json::from_str(message).context("Invalid Claude streaming response")?;
-    debug!("stream-data: {data}");
     if let Some(reason) = vertex_block_reason(&data) {
         bail!("Vertex AI blocked the request (reason: {reason})");
-    }
-    if event == "vertex-block-event" {
-        bail!("Vertex AI blocked the request");
     }
     let Some(typ) = data["type"].as_str() else {
         return Ok(false);
@@ -862,6 +864,49 @@ mod tests {
     }
 
     #[test]
+    fn streaming_invalid_tool_json_does_not_expose_arguments() -> Result<()> {
+        let (mut handler, mut rx) = test_handler();
+        let mut state = ClaudeStreamState::default();
+
+        for value in [
+            json!({"type":"content_block_delta","delta":{"text":"staged answer"}}),
+            json!({
+                "type":"content_block_start",
+                "index":4,
+                "content_block":{"type":"tool_use","id":"tool-invalid","name":"secret_tool"}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":4,
+                "delta":{"partial_json":"{\"secret\":\"must not escape\""}
+            }),
+        ] {
+            handle_value(&mut state, &mut handler, value)?;
+        }
+        let err = handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_stop","index":4}),
+        )
+        .expect_err("invalid tool JSON must abort the transaction");
+
+        assert_eq!(
+            err.to_string(),
+            "Claude tool call has invalid JSON arguments"
+        );
+        assert!(!err.to_string().contains("secret_tool"));
+        assert!(!err.to_string().contains("must not escape"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn streaming_fallback_block_is_rejected_without_staged_text() -> Result<()> {
         let (mut handler, mut rx) = test_handler();
         let mut state = ClaudeStreamState::default();
@@ -918,6 +963,35 @@ mod tests {
             err.to_string(),
             "Vertex AI blocked the request (reason: PROHIBITED_CONTENT)"
         );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_vertex_stream_block_event_is_still_explicit() -> Result<()> {
+        let (mut handler, mut rx) = test_handler();
+        let mut state = ClaudeStreamState::default();
+
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","delta":{"text":"blocked partial"}}),
+        )?;
+        let err = handle_claude_stream_message(
+            &mut state,
+            &mut handler,
+            "vertex-block-event",
+            "not-json",
+        )
+        .expect_err("the SSE event name itself identifies a Vertex block");
+
+        assert_eq!(err.to_string(), "Vertex AI blocked the request");
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
