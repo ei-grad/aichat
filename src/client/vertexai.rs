@@ -98,11 +98,7 @@ fn prepare_chat_completions(
     let location = self_.get_location()?;
     let access_token = get_access_token(self_.name())?;
 
-    let base_url = if location == "global" {
-        format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers")
-    } else {
-        format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers")
-    };
+    let base_url = prediction_base_url(&project_id, &location, *model_category);
 
     let model_name = self_.model.real_name();
 
@@ -115,7 +111,11 @@ fn prepare_chat_completions(
             format!("{base_url}/google/models/{model_name}:{func}")
         }
         ModelCategory::Claude => {
-            format!("{base_url}/anthropic/models/{model_name}:streamRawPredict")
+            let func = match data.stream {
+                true => "streamRawPredict",
+                false => "rawPredict",
+            };
+            format!("{base_url}/anthropic/models/{model_name}:{func}")
         }
         ModelCategory::Mistral => {
             let func = match data.stream {
@@ -150,6 +150,22 @@ fn prepare_chat_completions(
     request_data.bearer_auth(access_token);
 
     Ok(request_data)
+}
+
+fn prediction_base_url(
+    project_id: &str,
+    location: &str,
+    model_category: ModelCategory,
+) -> String {
+    let host = match (model_category, location) {
+        (_, "global") => "aiplatform.googleapis.com".to_string(),
+        (ModelCategory::Claude, "us") => "aiplatform.us.rep.googleapis.com".to_string(),
+        (ModelCategory::Claude, "eu") => "aiplatform.eu.rep.googleapis.com".to_string(),
+        _ => format!("{location}-aiplatform.googleapis.com"),
+    };
+    format!(
+        "https://{host}/v1/projects/{project_id}/locations/{location}/publishers"
+    )
 }
 
 fn prepare_embeddings(self_: &VertexAIClient, data: &EmbeddingsData) -> Result<RequestData> {
@@ -533,5 +549,98 @@ fn strip_model_version(name: &str) -> &str {
     match name.split_once('@') {
         Some((v, _)) => v,
         None => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude_client(location: &str) -> VertexAIClient {
+        let client_name = format!("vertexai-fable-route-test-{location}");
+        set_access_token(&client_name, "fixture-token".to_string(), i64::MAX);
+        let mut model = Model::new(&client_name, "claude-fable-5");
+        model.set_max_tokens(Some(128_000), true);
+        VertexAIClient {
+            global_config: Default::default(),
+            config: VertexAIConfig {
+                name: Some(client_name),
+                project_id: Some("fixture-project".to_string()),
+                location: Some(location.to_string()),
+                adc_file: None,
+                models: vec![],
+                patch: None,
+                extra: None,
+            },
+            model,
+        }
+    }
+
+    fn completion_data(stream: bool) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream,
+        }
+    }
+
+    #[test]
+    fn claude_global_and_multiregion_routes_match_vertex_contract() -> Result<()> {
+        for (location, host) in [
+            ("global", "aiplatform.googleapis.com"),
+            ("us", "aiplatform.us.rep.googleapis.com"),
+            ("eu", "aiplatform.eu.rep.googleapis.com"),
+        ] {
+            for (stream, suffix) in [(false, "rawPredict"), (true, "streamRawPredict")] {
+                let request = prepare_chat_completions(
+                    &claude_client(location),
+                    completion_data(stream),
+                    &ModelCategory::Claude,
+                )?;
+
+                assert_eq!(
+                    request.url,
+                    format!(
+                        "https://{host}/v1/projects/fixture-project/locations/{location}/publishers/anthropic/models/claude-fable-5:{suffix}"
+                    )
+                );
+                let mut expected_body = json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 128_000,
+                    "anthropic_version": "vertex-2023-10-16"
+                });
+                if stream {
+                    expected_body["stream"] = true.into();
+                }
+                assert_eq!(request.body, expected_body);
+                assert!(request.body.get("model").is_none());
+                assert_eq!(
+                    request.headers.get("authorization").map(String::as_str),
+                    Some("Bearer fixture-token")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_regional_routing_remains_unchanged() {
+        assert_eq!(
+            prediction_base_url(
+                "fixture-project",
+                "us-central1",
+                ModelCategory::Claude
+            ),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/fixture-project/locations/us-central1/publishers"
+        );
+        assert_eq!(
+            prediction_base_url("fixture-project", "us", ModelCategory::Gemini),
+            "https://us-aiplatform.googleapis.com/v1/projects/fixture-project/locations/us/publishers"
+        );
     }
 }
