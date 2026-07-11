@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let text = cli.text()?;
     let working_mode = if cli.serve.is_some() {
         WorkingMode::Serve
-    } else if text.is_none() && cli.file.is_empty() {
+    } else if text.is_none() && !cli.has_files() {
         WorkingMode::Repl
     } else {
         WorkingMode::Cmd
@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
 
 async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
     let abort_signal = create_abort_signal();
+    let files = cli.files();
 
     if cli.sync_models {
         let url = config.read().sync_models_url();
@@ -172,14 +173,14 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     if cli.execute && !is_repl {
-        let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
+        let input = create_input(&config, text, &files, abort_signal.clone()).await?;
         shell_execute(&config, &SHELL, input, abort_signal.clone()).await?;
         return Ok(());
     }
     config.write().apply_prelude()?;
     match is_repl {
         false => {
-            let mut input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
+            let mut input = create_input(&config, text, &files, abort_signal.clone()).await?;
             input.use_embeddings(abort_signal.clone()).await?;
             start_directive(&config, input, cli.code, abort_signal).await
         }
