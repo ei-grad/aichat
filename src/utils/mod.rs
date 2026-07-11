@@ -37,8 +37,6 @@ pub static CODE_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
-pub static THINK_CLOSE_ONLY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)^\s*.*?</think>\s*").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
 pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
     env::var("NO_COLOR")
@@ -92,16 +90,53 @@ pub fn estimate_token_length(text: &str) -> usize {
 
 pub fn strip_think_tag(text: &str) -> Cow<'_, str> {
     let stripped = THINK_TAG_RE.replace_all(text, "");
-    if stripped.len() < text.len() {
+    if stripped.len() != text.len() {
         return stripped;
     }
-    // Qwen3.6 (and similar local models) embed the opening think tag in the chat
-    // template, so streamed output only contains the reasoning body followed by
-    // a closing </think> tag.
-    if !text.contains("<think>") && text.contains("</think>") {
-        return THINK_CLOSE_ONLY_RE.replace_all(text, "");
+    strip_close_only_think_block(text)
+        .map(Cow::Borrowed)
+        .unwrap_or(stripped)
+}
+
+fn strip_close_only_think_block(text: &str) -> Option<&str> {
+    const OPEN_TAG: &str = "<think>";
+    const CLOSE_TAG: &str = "</think>";
+
+    // Without provider metadata, only a single standalone closing-tag line is
+    // treated as structural. Inline, repeated, and fenced examples stay literal.
+    if text.contains(OPEN_TAG) || text.match_indices(CLOSE_TAG).count() != 1 {
+        return None;
     }
-    stripped
+
+    let close_start = text.find(CLOSE_TAG)?;
+    let close_line_start = text[..close_start].rfind('\n')? + 1;
+    if !text[close_line_start..close_start].trim().is_empty() {
+        return None;
+    }
+
+    let reasoning = &text[..close_line_start];
+    if reasoning.trim().is_empty() || has_unclosed_markdown_fence(reasoning) {
+        return None;
+    }
+
+    let after_close = &text[close_start + CLOSE_TAG.len()..];
+    match after_close.find('\n') {
+        Some(line_end) if after_close[..line_end].trim().is_empty() => {
+            Some(after_close[line_end + 1..].trim_start())
+        }
+        None if after_close.trim().is_empty() => Some(""),
+        _ => None,
+    }
+}
+
+fn has_unclosed_markdown_fence(text: &str) -> bool {
+    ["```", "~~~"].into_iter().any(|fence| {
+        text.lines()
+            .filter(|line| line.trim_start().starts_with(fence))
+            .count()
+            % 2
+            == 1
+    })
 }
 
 pub fn extract_code_block(text: &str) -> &str {
@@ -260,20 +295,46 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_think_tag_with_opening_tag() {
-        let text = "<think>\nreasoning\n</think>\n\nanswer";
+    fn strip_think_tag_removes_full_tagged_block() {
+        let text = "  <think>\r\nreasoning\r\n</think>\r\n\r\nanswer";
         assert_eq!(strip_think_tag(text), "answer");
     }
 
     #[test]
-    fn test_strip_think_tag_close_only_qwen36() {
-        let text = "reasoning without opening tag\n</think>\n\nanswer";
+    fn strip_think_tag_removes_structural_close_only_block() {
+        let text = "reasoning without an opening tag\n</think>\n\nanswer";
         assert_eq!(strip_think_tag(text), "answer");
+
+        let text = "\n  reasoning with whitespace\r\n  </think>  \r\n\t answer ";
+        assert_eq!(strip_think_tag(text), "answer ");
+
+        let text = "reasoning only\n</think>";
+        assert_eq!(strip_think_tag(text), "");
     }
 
     #[test]
-    fn test_strip_think_tag_without_thinking() {
-        let text = "plain answer";
-        assert_eq!(strip_think_tag(text), "plain answer");
+    fn strip_think_tag_preserves_plain_and_literal_close_tags() {
+        for text in [
+            "plain answer",
+            "Use </think> literally in documentation.",
+            "</think>\nanswer without a reasoning prefix",
+            "reasoning</think>\nanswer without a standalone marker",
+            "reasoning\n</think> trailing text\nanswer",
+            "first\n</think>\nanswer with another </think> literal",
+            "prefix with an unmatched <think> marker\n</think>\nanswer",
+        ] {
+            assert_eq!(strip_think_tag(text), text);
+        }
+    }
+
+    #[test]
+    fn strip_think_tag_preserves_close_tag_in_fenced_code() {
+        for text in [
+            "```html\n</think>\n```\n",
+            "~~~text\n</think>\n~~~\n",
+            "prose before an open fence\n```\n</think>\n",
+        ] {
+            assert_eq!(strip_think_tag(text), text);
+        }
     }
 }
