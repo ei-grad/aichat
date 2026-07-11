@@ -256,8 +256,7 @@ pub async fn openai_chat_completions_streaming(
     sse_stream(builder, |message: SseMmessage| {
         handle_openai_stream_message(&mut state, handler, &message.data)
     })
-    .await?;
-    state.finish_tool_calls(handler)
+    .await
 }
 
 pub async fn openai_embeddings(
@@ -602,6 +601,68 @@ mod tests {
         assert_eq!(calls[0].name, "web_search");
         assert_eq!(calls[0].id.as_deref(), Some("call_long_identifier"));
         assert_eq!(calls[0].arguments, json!({"query":"Rust"}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncated_sse_does_not_dispatch_pending_tool_call() -> Result<()> {
+        let tool_delta = json!({
+            "choices":[{"delta":{"tool_calls":[{
+                "index":0,
+                "id":"call_side_effect",
+                "function":{"name":"side_effect","arguments":"{}"}
+            }]}}]
+        });
+        let builder = sse_fixture_builder(&format!("data: {tool_delta}\n\n")).await?;
+        let (mut handler, mut rx) = test_handler();
+
+        let err = openai_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("openai", "test-model"),
+        )
+        .await
+        .expect_err("EOF without [DONE] must fail");
+
+        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert!(handler.tool_calls().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn done_marker_dispatches_completed_tool_call_once() -> Result<()> {
+        let tool_delta = json!({
+            "choices":[{"delta":{"tool_calls":[{
+                "index":0,
+                "id":"call_complete",
+                "function":{"name":"side_effect","arguments":"{}"}
+            }]}}]
+        });
+        let builder = sse_fixture_builder(&format!(
+            "data: {tool_delta}\n\ndata: [DONE]\n\n"
+        ))
+        .await?;
+        let (mut handler, _rx) = test_handler();
+
+        openai_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("openai", "test-model"),
+        )
+        .await?;
+
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "side_effect");
+        assert_eq!(calls[0].arguments, json!({}));
         Ok(())
     }
 
