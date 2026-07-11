@@ -72,92 +72,116 @@ pub async fn claude_chat_completions(
     claude_extract_chat_completions(&data)
 }
 
+#[derive(Debug, Default)]
+struct ClaudeStreamState {
+    tool_call: Option<PendingClaudeToolCall>,
+    reasoning: bool,
+}
+
+impl ClaudeStreamState {
+    fn finish_tool_call(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if let Some(tool_call) = self.tool_call.take() {
+            handler.tool_call(tool_call.into_tool_call()?)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingClaudeToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl PendingClaudeToolCall {
+    fn into_tool_call(self) -> Result<ToolCall> {
+        let arguments = if self.arguments.is_empty() {
+            json!({})
+        } else {
+            self.arguments.parse().with_context(|| {
+                format!(
+                    "Tool call '{}' has non-JSON arguments '{}'",
+                    self.name, self.arguments
+                )
+            })?
+        };
+        Ok(ToolCall::new(self.name, arguments, Some(self.id)))
+    }
+}
+
+fn handle_claude_stream_message(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+    message: &str,
+) -> Result<bool> {
+    let data: Value = serde_json::from_str(message).context("Invalid Claude streaming response")?;
+    debug!("stream-data: {data}");
+    let Some(typ) = data["type"].as_str() else {
+        return Ok(false);
+    };
+
+    match typ {
+        "content_block_start" => {
+            if let (Some("tool_use"), Some(name), Some(id)) = (
+                data["content_block"]["type"].as_str(),
+                data["content_block"]["name"].as_str(),
+                data["content_block"]["id"].as_str(),
+            ) {
+                state.finish_tool_call(handler)?;
+                state.tool_call = Some(PendingClaudeToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: String::new(),
+                });
+            }
+        }
+        "content_block_delta" => {
+            if let Some(text) = data["delta"]["text"].as_str() {
+                handler.text(text)?;
+            } else if let Some(text) = data["delta"]["thinking"].as_str() {
+                if !state.reasoning {
+                    handler.text("<think>\n")?;
+                    state.reasoning = true;
+                }
+                handler.text(text)?;
+            } else if let (Some(tool_call), Some(partial_json)) = (
+                state.tool_call.as_mut(),
+                data["delta"]["partial_json"].as_str(),
+            ) {
+                tool_call.arguments.push_str(partial_json);
+            }
+        }
+        "content_block_stop" => {
+            if state.reasoning {
+                handler.text("\n</think>\n\n")?;
+                state.reasoning = false;
+            }
+            state.finish_tool_call(handler)?;
+        }
+        "error" => {
+            let error_type = data["error"]["type"].as_str().unwrap_or("unknown_error");
+            let message = data["error"]["message"]
+                .as_str()
+                .unwrap_or("Claude streaming request failed");
+            bail!("{message} (type: {error_type})");
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 pub async fn claude_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
-    let handle = |message: SseMmessage| -> Result<bool> {
-        let data: Value = serde_json::from_str(&message.data)?;
-        debug!("stream-data: {data}");
-        if let Some(typ) = data["type"].as_str() {
-            match typ {
-                "content_block_start" => {
-                    if let (Some("tool_use"), Some(name), Some(id)) = (
-                        data["content_block"]["type"].as_str(),
-                        data["content_block"]["name"].as_str(),
-                        data["content_block"]["id"].as_str(),
-                    ) {
-                        if !function_name.is_empty() {
-                            let arguments: Value =
-                                function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                })?;
-                            handler.tool_call(ToolCall::new(
-                                function_name.clone(),
-                                arguments,
-                                Some(function_id.clone()),
-                            ))?;
-                        }
-                        function_name = name.into();
-                        function_arguments.clear();
-                        function_id = id.into();
-                    }
-                }
-                "content_block_delta" => {
-                    if let Some(text) = data["delta"]["text"].as_str() {
-                        handler.text(text)?;
-                    } else if let Some(text) = data["delta"]["thinking"].as_str() {
-                        if reasoning_state == 0 {
-                            handler.text("<think>\n")?;
-                            reasoning_state = 1;
-                        }
-                        handler.text(text)?;
-                    } else if let (true, Some(partial_json)) = (
-                        !function_name.is_empty(),
-                        data["delta"]["partial_json"].as_str(),
-                    ) {
-                        function_arguments.push_str(partial_json);
-                    }
-                }
-                "content_block_stop" => {
-                    if reasoning_state == 1 {
-                        handler.text("\n</think>\n\n")?;
-                        reasoning_state = 0;
-                    }
-                    if !function_name.is_empty() {
-                        let arguments: Value = if function_arguments.is_empty() {
-                            json!({})
-                        } else {
-                            function_arguments.parse().with_context(|| {
-                                format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                            })?
-                        };
-                        handler.tool_call(ToolCall::new(
-                            function_name.clone(),
-                            arguments,
-                            Some(function_id.clone()),
-                        ))?;
-                    }
-                }
-                "error" => {
-                    let err_type = data["error"]["type"].as_str().unwrap_or("unknown");
-                    let err_msg = data["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Unknown error");
-                    bail!("{err_msg} (type: {err_type})");
-                }
-                _ => {}
-            }
-        }
-        Ok(false)
-    };
-
-    sse_stream(builder, handle).await
+    let mut state = ClaudeStreamState::default();
+    sse_stream(builder, |message: SseMmessage| {
+        handle_claude_stream_message(&mut state, handler, &message.data)
+    })
+    .await?;
+    state.finish_tool_call(handler)
 }
 
 pub fn claude_build_chat_completions_body(
@@ -357,4 +381,95 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         output_tokens: data["usage"]["output_tokens"].as_u64(),
     };
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::utils::create_abort_signal;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    fn test_handler() -> (SseHandler, UnboundedReceiver<SseEvent>) {
+        let (tx, rx) = unbounded_channel();
+        (SseHandler::new(tx, create_abort_signal()), rx)
+    }
+
+    fn handle_value(
+        state: &mut ClaudeStreamState,
+        handler: &mut SseHandler,
+        value: Value,
+    ) -> Result<bool> {
+        handle_claude_stream_message(state, handler, &value.to_string())
+    }
+
+    #[test]
+    fn streaming_error_is_readable_and_does_not_dispatch_partial_output() -> Result<()> {
+        let (mut handler, _rx) = test_handler();
+        let mut state = ClaudeStreamState::default();
+
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({
+                "type":"content_block_start",
+                "content_block":{"type":"tool_use","id":"tool_partial","name":"lookup"}
+            }),
+        )?;
+        handle_value(
+            &mut state,
+            &mut handler,
+            json!({"type":"content_block_delta","delta":{"partial_json":"{\"query\":"}}),
+        )?;
+        let err = handle_value(
+            &mut state,
+            &mut handler,
+            json!({
+                "type":"error",
+                "error":{"type":"overloaded_error","message":"Overloaded"}
+            }),
+        )
+        .expect_err("provider error must stop the stream");
+
+        assert_eq!(err.to_string(), "Overloaded (type: overloaded_error)");
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn successful_content_reasoning_and_tool_stream_is_unchanged() -> Result<()> {
+        let (mut handler, _rx) = test_handler();
+        let mut state = ClaudeStreamState::default();
+
+        for value in [
+            json!({"type":"content_block_delta","delta":{"thinking":"reason"}}),
+            json!({"type":"content_block_stop"}),
+            json!({"type":"content_block_delta","delta":{"text":"answer"}}),
+            json!({
+                "type":"content_block_start",
+                "content_block":{"type":"tool_use","id":"tool_one","name":"first"}
+            }),
+            json!({"type":"content_block_delta","delta":{"partial_json":"{\"value\":1}"}}),
+            json!({"type":"content_block_stop"}),
+            json!({
+                "type":"content_block_start",
+                "content_block":{"type":"tool_use","id":"tool_two","name":"second"}
+            }),
+            json!({"type":"content_block_stop"}),
+        ] {
+            handle_value(&mut state, &mut handler, value)?;
+        }
+        state.finish_tool_call(&mut handler)?;
+
+        let (text, calls) = handler.take();
+        assert_eq!(text, "<think>\nreason\n</think>\n\nanswer");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "first");
+        assert_eq!(calls[0].arguments, json!({"value":1}));
+        assert_eq!(calls[1].name, "second");
+        assert_eq!(calls[1].arguments, json!({}));
+        Ok(())
+    }
 }

@@ -676,3 +676,21 @@ fn prompt_input_string(
     let text = text.prompt()?;
     Ok(text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catch_error_recognizes_numeric_code_and_detail() {
+        let err = catch_error(&json!({"code":529,"detail":"Overloaded"}), 529)
+            .expect_err("non-success response must fail");
+
+        assert_eq!(err.to_string(), "Overloaded (status: 529)");
+    }
+
+    #[test]
+    fn catch_error_keeps_successful_response_as_control() {
+        assert!(catch_error(&json!({"code":529,"detail":"Overloaded"}), 200).is_ok());
+    }
+}
