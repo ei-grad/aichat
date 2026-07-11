@@ -383,3 +383,21 @@ fn setup_logger(is_serve: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_command_returns_before_info_prelude() {
+        let config = Arc::new(RwLock::new(Config {
+            cmd_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        }));
+        let cli = Cli::try_parse_from(["aichat", "--list-models", "--info"]).unwrap();
+
+        run(config.clone(), cli, None).await.unwrap();
+
+        assert!(config.read().state().is_empty());
+    }
+}
