@@ -228,7 +228,7 @@ macro_rules! config_get_fn {
         $crate::config_get_fn!($field_name, $fn_name, []);
     };
     ($field_name:ident, $fn_name:ident, [$($env_alias:literal),* $(,)?]) => {
-        fn $fn_name(&self) -> anyhow::Result<String> {
+        fn $fn_name(&self) -> $crate::client::ConfigFieldResult<String> {
             let env_prefix = Self::name(&self.config);
             $crate::client::resolve_config_field(
                 env_prefix,
