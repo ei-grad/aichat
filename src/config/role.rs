@@ -18,6 +18,32 @@ pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 #[folder = "assets/roles/"]
 struct RolesAsset;
 
+fn is_front_matter_fence(line: &str) -> bool {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.trim_end_matches(|c| matches!(c, ' ' | '\t')) == "---"
+}
+
+fn split_front_matter(content: &str) -> Option<(&str, &str)> {
+    let mut lines = content.split_inclusive('\n');
+    let opening = lines.next()?;
+    if !is_front_matter_fence(opening) {
+        return None;
+    }
+
+    let metadata_start = opening.len();
+    let mut line_start = metadata_start;
+    for line in lines {
+        if is_front_matter_fence(line) {
+            let metadata = content[metadata_start..line_start].trim();
+            let prompt = content[line_start + line.len()..].trim();
+            return Some((metadata, prompt));
+        }
+        line_start += line.len();
+    }
+    None
+}
+
 pub trait RoleLike {
     fn to_role(&self) -> Role;
     fn model(&self) -> &Model;
@@ -53,9 +79,11 @@ pub struct Role {
 
 impl Role {
     pub fn new(name: &str, content: &str) -> Self {
-        let content = content.replace("\r\n", "\n");
-        let (metadata, prompt) = Self::split_metadata(&content);
-
+        // A front-matter opening fence must start at byte zero. Leading whitespace and a UTF-8
+        // BOM are prompt content; fences may only have trailing ASCII horizontal whitespace.
+        let (metadata, prompt) = split_front_matter(content)
+            .map(|(metadata, prompt)| (Some(metadata), prompt))
+            .unwrap_or_else(|| (None, content.trim()));
         let mut prompt = prompt.to_string();
         interpolate_variables(&mut prompt);
         let mut role = Self {
@@ -63,9 +91,8 @@ impl Role {
             prompt,
             ..Default::default()
         };
-
-        if let Some(metadata) = metadata {
-            if let Ok(value) = serde_yaml::from_str::<Value>(&metadata) {
+        if let Some(metadata) = metadata.filter(|metadata| !metadata.is_empty()) {
+            if let Ok(value) = serde_yaml::from_str::<Value>(metadata) {
                 if let Some(value) = value.as_object() {
                     for (key, value) in value {
                         match key.as_str() {
@@ -82,83 +109,6 @@ impl Role {
         role
     }
 
-    fn is_delimiter_line(s: &str) -> bool {
-        let mut chars = s.chars();
-        match (chars.next(), chars.next(), chars.next()) {
-            (Some('-'), Some('-'), Some('-')) => {
-                // The rest should be whitespace until newline
-                chars.all(|c| c.is_whitespace())
-            }
-            _ => false,
-        }
-    }
-
-    /// Splits a string into optional metadata and content using `---` fences.
-    ///
-    /// Format must be:
-    /// ```
-    /// ---
-    /// metadata (YAML)
-    /// ---
-    /// content
-    /// ```
-    ///
-    /// Returns:
-    /// - `None` if format invalid or metadata empty
-    /// - Trimmed content starting after second `---`
-    ///
-    /// Whitespace and comments around `---` are rejected.
-    fn split_metadata(input: &str) -> (Option<String>, &str) {
-        let mut lines = input.split_inclusive('\n');
-
-        let first_line = match lines.next() {
-            Some(l) => l,
-            None => return (None, input),
-        };
-
-        if !Self::is_delimiter_line(first_line) {
-            return (None, input);
-        }
-
-        let mut pos = first_line.len();
-        let mut second_delimiter_pos = None;
-
-        for line in lines {
-            if Self::is_delimiter_line(line) {
-                second_delimiter_pos = Some(pos);
-                break;
-            }
-            pos += line.len();
-        }
-
-        let meta_end = match second_delimiter_pos {
-            Some(p) => p,
-            None => return (None, input),
-        };
-
-        let metadata_start = first_line.len();
-        let content_start = meta_end + {
-            let rest = &input[meta_end..];
-            match rest.find('\n') {
-                Some(i) => i + 1,
-                None => 0, // no newline? then start immediately
-            }
-        };
-
-        let metadata = input.get(metadata_start..meta_end)
-        .and_then(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        });
-
-        let content = input.get(content_start..).map(str::trim_start).unwrap_or_default();
-
-        (metadata, content)
-    }
     pub fn builtin(name: &str) -> Result<Self> {
         let content = RolesAsset::get(&format!("{name}.md"))
             .ok_or_else(|| anyhow!("Unknown role `{name}`"))?;
@@ -458,52 +408,90 @@ Input 1
 "#;
         assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
     }
+
     #[test]
-    fn test_simple_metadata() {
-        let input = r#"---
-title: hello
----
-Hello world!"#;
-        let (meta, content) = Role::split_metadata(input);
-        assert_eq!(meta.as_deref(), Some("title: hello"));
-        assert_eq!(content, "Hello world!");
+    fn test_split_front_matter() {
+        let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.5\n---\n\n  Be concise.  \n";
+        assert_eq!(
+            split_front_matter(content),
+            Some(("model: openai:gpt-4o\ntemperature: 0.5", "Be concise."))
+        );
+
+        let role = Role::new("concise", content);
+        assert_eq!(role.model_id(), Some("openai:gpt-4o"));
+        assert_eq!(role.temperature(), Some(0.5));
+        assert_eq!(role.prompt(), "Be concise.");
     }
 
     #[test]
-    fn test_no_closing() {
-        let input = "---\ntitle: missing end";
-        let (meta, content) = Role::split_metadata(input);
-        assert!(meta.is_none());
-        assert_eq!(content, input);
+    fn test_front_matter_closing_fence_at_eof() {
+        assert_eq!(
+            split_front_matter("---\nmodel: openai:gpt-4o\n---"),
+            Some(("model: openai:gpt-4o", ""))
+        );
     }
 
     #[test]
-    fn test_trailing_comment_rejected() {
-        let input = "--- # start\nvalue: ok\n--- # end\ncontent";
-        let (meta, _) = Role::split_metadata(input);
-        assert!(meta.is_none()); // because `--- # end` → trim_end != "---"
+    fn test_front_matter_accepts_crlf_unicode_and_fence_whitespace() {
+        let content = "--- \t\r\nmodel: claude:sonnet\r\nunknown: 🐱\r\n---\t \r\n  内容\r\n";
+        assert_eq!(
+            split_front_matter(content),
+            Some(("model: claude:sonnet\r\nunknown: 🐱", "内容"))
+        );
+        let role = Role::new("unicode", content);
+        assert_eq!(role.model_id(), Some("claude:sonnet"));
+        assert_eq!(role.prompt(), "内容");
     }
 
     #[test]
-    fn test_multibyte_unicode_safe() {
-        let input = "---\n表情: 🐱\n---\n内容 starts here";
-        let (meta, content) = Role::split_metadata(input);
-        assert_eq!(meta.as_deref(), Some("表情: 🐱"));
-        assert_eq!(content, "内容 starts here");
-    }
-    #[test]
-    fn test_empty_metadata() {
-        let input = "---\n---\nHello";
-        let (meta, content) = Role::split_metadata(input);
-        assert!(meta.is_none());
-        assert_eq!(content, "Hello");
+    fn test_empty_front_matter_is_valid() {
+        assert_eq!(
+            split_front_matter("---\n\t  \n---\n prompt "),
+            Some(("", "prompt"))
+        );
+        assert_eq!(Role::new("empty", "---\n---\n prompt ").prompt(), "prompt");
     }
 
     #[test]
-    fn test_whitespace_delimiters() {
-        let input = "---  \nkey: val\n---  \ncontent";
-        let (meta, content) = Role::split_metadata(input);
-        assert_eq!(meta.as_deref(), Some("key: val"));
-        assert_eq!(content, "content");
+    fn test_horizontal_rules_inside_prompt_are_preserved() {
+        let content = "Introduction\n\n---\n\nConclusion";
+        assert_eq!(split_front_matter(content), None);
+        assert_eq!(Role::new("rule", content).prompt(), content);
+
+        let content = "---\nmodel: openai:gpt-4o\n---\nIntro\n---\nOutro";
+        assert_eq!(
+            split_front_matter(content),
+            Some(("model: openai:gpt-4o", "Intro\n---\nOutro"))
+        );
+    }
+
+    #[test]
+    fn test_front_matter_requires_exact_opening_at_byte_zero() {
+        for content in [
+            "\n---\nmodel: openai:gpt-4o\n---\nprompt",
+            " ---\nmodel: openai:gpt-4o\n---\nprompt",
+            "\u{feff}---\nmodel: openai:gpt-4o\n---\nprompt",
+            "----\nmodel: openai:gpt-4o\n----\nprompt",
+        ] {
+            assert_eq!(split_front_matter(content), None, "content: {content:?}");
+            assert_eq!(Role::new("plain", content).prompt(), content.trim());
+        }
+    }
+
+    #[test]
+    fn test_malformed_or_unclosed_front_matter_remains_prompt() {
+        for content in [
+            "---\nmodel: openai:gpt-4o",
+            "--- # opening\nmodel: openai:gpt-4o\n---\nprompt",
+            "---\nmodel: openai:gpt-4o\n--- # closing\nprompt",
+        ] {
+            assert_eq!(split_front_matter(content), None, "content: {content:?}");
+            assert_eq!(Role::new("plain", content).prompt(), content.trim());
+        }
+    }
+
+    #[test]
+    fn test_role_prompt_trim_contract_without_front_matter() {
+        assert_eq!(Role::new("plain", " \n  prompt body  \n ").prompt(), "prompt body");
     }
 }
