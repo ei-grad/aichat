@@ -1610,34 +1610,39 @@ impl Config {
     }
 
     pub fn apply_prelude(&mut self) -> Result<()> {
-        if self.macro_flag || !self.state().is_empty() {
-            return Ok(());
-        }
         let prelude = match self.working_mode {
             WorkingMode::Repl => self.repl_prelude.clone(),
             WorkingMode::Cmd => self.cmd_prelude.clone(),
             WorkingMode::Serve => return Ok(()),
         };
-        self.apply_prelude_value(prelude.as_deref())
+
+        self.apply_prelude_value(prelude)
     }
 
     pub fn apply_info_prelude(&mut self) -> Result<()> {
+        let prelude = self
+            .cmd_prelude
+            .as_ref()
+            .or(self.repl_prelude.as_ref())
+            .cloned();
+        self.apply_prelude_value(prelude)
+    }
+
+    fn apply_prelude_value(&mut self, prelude: Option<String>) -> Result<()> {
         if self.macro_flag || !self.state().is_empty() {
             return Ok(());
         }
-        let prelude = self
-            .cmd_prelude
-            .clone()
-            .or_else(|| self.repl_prelude.clone());
-        self.apply_prelude_value(prelude.as_deref())
-    }
-
-    fn apply_prelude_value(&mut self, prelude: Option<&str>) -> Result<()> {
-        let Some(prelude) = prelude.filter(|v| !v.is_empty()) else {
-            return Ok(());
+        let prelude = match prelude {
+            Some(v) => {
+                if v.is_empty() {
+                    return Ok(());
+                }
+                v
+            }
+            None => return Ok(()),
         };
 
-        let err_msg = || format!("Invalid prelude '{prelude}");
+        let err_msg = || format!("Invalid prelude '{prelude}'");
         match prelude.split_once(':') {
             Some(("role", name)) => {
                 self.use_role(name).with_context(err_msg)?;
@@ -2749,5 +2754,102 @@ where
     match value {
         Some(value) => value.to_string(),
         None => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected_role(config: &Config) -> Option<&str> {
+        config.role.as_ref().map(Role::name)
+    }
+
+    #[test]
+    fn info_prelude_prefers_command_configuration() {
+        let mut config = Config {
+            cmd_prelude: Some(format!("role:{SHELL_ROLE}")),
+            repl_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        };
+
+        config.apply_info_prelude().unwrap();
+
+        assert_eq!(selected_role(&config), Some(SHELL_ROLE));
+    }
+
+    #[test]
+    fn info_prelude_falls_back_only_when_command_configuration_is_absent() {
+        let mut config = Config {
+            repl_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        };
+        config.apply_info_prelude().unwrap();
+        assert_eq!(selected_role(&config), Some(CODE_ROLE));
+
+        let mut config = Config {
+            cmd_prelude: Some(String::new()),
+            repl_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        };
+        config.apply_info_prelude().unwrap();
+        assert_eq!(selected_role(&config), None);
+    }
+
+    #[test]
+    fn info_prelude_preserves_explicit_role_and_session_state() {
+        let mut config = Config {
+            cmd_prelude: Some(format!("role:{CODE_ROLE}")),
+            role: Some(Role::new("explicit", "explicit prompt")),
+            ..Default::default()
+        };
+        config.apply_info_prelude().unwrap();
+        assert_eq!(selected_role(&config), Some("explicit"));
+
+        let mut config = Config {
+            cmd_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        };
+        config.session = Some(Session::new(&config, "explicit-session"));
+        config.apply_info_prelude().unwrap();
+        assert_eq!(
+            config.session.as_ref().map(Session::name),
+            Some("explicit-session")
+        );
+        assert_eq!(selected_role(&config), None);
+    }
+
+    #[test]
+    fn info_prelude_reports_empty_and_invalid_values_consistently() {
+        let mut config = Config {
+            cmd_prelude: Some(String::new()),
+            ..Default::default()
+        };
+        config.apply_info_prelude().unwrap();
+
+        config.cmd_prelude = Some("invalid".into());
+        let error = config.apply_info_prelude().unwrap_err();
+        assert_eq!(error.to_string(), "Invalid prelude 'invalid'");
+    }
+
+    #[test]
+    fn normal_prelude_keeps_working_mode_specific_behavior() {
+        let mut config = Config {
+            working_mode: WorkingMode::Cmd,
+            cmd_prelude: Some(format!("role:{SHELL_ROLE}")),
+            repl_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        };
+        config.apply_prelude().unwrap();
+        assert_eq!(selected_role(&config), Some(SHELL_ROLE));
+
+        let mut config = Config {
+            working_mode: WorkingMode::Repl,
+            cmd_prelude: Some(format!("role:{SHELL_ROLE}")),
+            repl_prelude: Some(format!("role:{CODE_ROLE}")),
+            ..Default::default()
+        };
+        config.apply_prelude().unwrap();
+        assert_eq!(selected_role(&config), Some(CODE_ROLE));
     }
 }
