@@ -137,6 +137,19 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             ..chat("claude-sonnet-5")
         }
     );
+    assert_eq!(
+        model(claude, "claude-fable-5"),
+        &ModelRecord {
+            max_input_tokens: Some(1_000_000),
+            input_price: Some(10.0),
+            output_price: Some(50.0),
+            patch: Some(sampling_patch()),
+            max_output_tokens: Some(128_000),
+            require_max_tokens: Some(true),
+            supports_vision: Some(true),
+            ..chat("claude-fable-5")
+        }
+    );
 
     let vertexai = provider(&catalog, "vertexai");
     assert_eq!(
@@ -185,6 +198,27 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             ..chat("claude-sonnet-5")
         }
     );
+    assert_eq!(
+        model(vertexai, "claude-fable-5"),
+        &ModelRecord {
+            max_input_tokens: Some(1_000_000),
+            patch: Some(sampling_patch()),
+            max_output_tokens: Some(128_000),
+            require_max_tokens: Some(true),
+            supports_vision: Some(true),
+            ..chat("claude-fable-5")
+        }
+    );
+
+    for provider in [claude, vertexai] {
+        let fable = model(provider, "claude-fable-5");
+        assert_eq!(fable.supports_function_calling, None);
+        assert_eq!(fable.real_name, None);
+        assert!(provider
+            .models
+            .iter()
+            .all(|model| model.name != "claude-fable-5:thinking"));
+    }
 }
 
 #[test]
@@ -196,7 +230,6 @@ fn rejected_override_additions_remain_absent() {
         ("gemini", "gemini-2.0-flash"),
         ("gemini", "gemini-2.0-flash-lite"),
         ("gemini", "text-embedding-004"),
-        ("claude", "claude-fable-5"),
         ("vertexai", "gemini-3-pro-preview"),
         ("vertexai", "gemini-2.0-flash-001"),
         ("vertexai", "gemini-2.0-flash-lite-001"),
@@ -288,6 +321,7 @@ fn overlay_is_append_only_and_preserves_reviewed_catalog_entries() {
             "claude-opus-4-8",
             "claude-opus-4-8:thinking",
             "claude-sonnet-5",
+            "claude-fable-5",
         ]
     );
     assert_eq!(
@@ -317,6 +351,7 @@ fn overlay_is_append_only_and_preserves_reviewed_catalog_entries() {
             "claude-opus-4-8",
             "claude-opus-4-8:thinking",
             "claude-sonnet-5",
+            "claude-fable-5",
         ]
     );
 
