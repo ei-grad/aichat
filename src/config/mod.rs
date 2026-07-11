@@ -94,7 +94,7 @@ __INPUT__
 const LEFT_PROMPT: &str = "{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
 const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
 
-static EDITOR: OnceLock<Option<String>> = OnceLock::new();
+static EDITOR: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -1637,7 +1637,7 @@ impl Config {
                 if v.is_empty() {
                     return Ok(());
                 }
-                v
+                v.to_string()
             }
             None => return Ok(()),
         };
@@ -1733,18 +1733,22 @@ impl Config {
     }
 
     pub fn editor(&self) -> Result<String> {
-        if let Some(editor) = EDITOR.get() {
-            return editor
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."
-                    )
-                });
-        }
-        let editor = resolve_editor(self.editor.as_deref())?;
-        let _ = EDITOR.set(Some(editor.clone()));
-        Ok(editor)
+        EDITOR
+            .get_or_init(|| {
+                let visual = env::var("VISUAL").ok();
+                let editor = env::var("EDITOR").ok();
+                let default = if cfg!(windows) { "notepad" } else { "nano" };
+                resolve_editor_command(
+                    self.editor.as_deref(),
+                    visual.as_deref(),
+                    editor.as_deref(),
+                    default,
+                    |program| which::which(program).is_ok(),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn repl_complete(
