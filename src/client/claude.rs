@@ -74,13 +74,27 @@ pub async fn claude_chat_completions(
 #[derive(Debug, Default)]
 struct ClaudeStreamState {
     tool_call: Option<PendingClaudeToolCall>,
+    completed_tool_calls: Vec<ToolCall>,
     reasoning: bool,
 }
 
 impl ClaudeStreamState {
-    fn finish_tool_call(&mut self, handler: &mut SseHandler) -> Result<()> {
+    fn finish_tool_call(&mut self) -> Result<()> {
         if let Some(tool_call) = self.tool_call.take() {
-            handler.tool_call(tool_call.into_tool_call()?)?;
+            self.completed_tool_calls.push(tool_call.into_tool_call()?);
+        }
+        Ok(())
+    }
+
+    fn finish_message(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if self.tool_call.is_some() {
+            bail!("Claude message_stop arrived before tool_use content_block_stop");
+        }
+        if self.reasoning {
+            bail!("Claude message_stop arrived before reasoning content_block_stop");
+        }
+        for tool_call in std::mem::take(&mut self.completed_tool_calls) {
+            handler.tool_call(tool_call)?;
         }
         Ok(())
     }
@@ -88,6 +102,7 @@ impl ClaudeStreamState {
 
 #[derive(Debug)]
 struct PendingClaudeToolCall {
+    index: u64,
     id: String,
     name: String,
     arguments: String,
@@ -127,8 +142,14 @@ fn handle_claude_stream_message(
                 data["content_block"]["name"].as_str(),
                 data["content_block"]["id"].as_str(),
             ) {
-                state.finish_tool_call(handler)?;
+                if state.tool_call.is_some() {
+                    bail!("Claude started a new tool_use before content_block_stop");
+                }
+                let index = data["index"]
+                    .as_u64()
+                    .context("Claude tool_use content_block_start is missing an index")?;
                 state.tool_call = Some(PendingClaudeToolCall {
+                    index,
                     id: id.to_string(),
                     name: name.to_string(),
                     arguments: String::new(),
@@ -148,6 +169,15 @@ fn handle_claude_stream_message(
                 state.tool_call.as_mut(),
                 data["delta"]["partial_json"].as_str(),
             ) {
+                let index = data["index"]
+                    .as_u64()
+                    .context("Claude tool_use content_block_delta is missing an index")?;
+                if tool_call.index != index {
+                    bail!(
+                        "Claude tool_use block {} received delta for block {index}",
+                        tool_call.index
+                    );
+                }
                 tool_call.arguments.push_str(partial_json);
             }
         }
@@ -156,7 +186,22 @@ fn handle_claude_stream_message(
                 handler.text("\n</think>\n\n")?;
                 state.reasoning = false;
             }
-            state.finish_tool_call(handler)?;
+            if let Some(tool_call) = state.tool_call.as_ref() {
+                let index = data["index"]
+                    .as_u64()
+                    .context("Claude tool_use content_block_stop is missing an index")?;
+                if tool_call.index != index {
+                    bail!(
+                        "Claude tool_use block {} stopped by block {index}",
+                        tool_call.index
+                    );
+                }
+            }
+            state.finish_tool_call()?;
+        }
+        "message_stop" => {
+            state.finish_message(handler)?;
+            return Ok(true);
         }
         "error" => {
             let error_type = data["error"]["type"].as_str().unwrap_or("unknown_error");
@@ -179,8 +224,7 @@ pub async fn claude_chat_completions_streaming(
     sse_stream(builder, |message: SseMmessage| {
         handle_claude_stream_message(&mut state, handler, &message.data)
     })
-    .await?;
-    state.finish_tool_call(handler)
+    .await
 }
 
 pub fn claude_build_chat_completions_body(
@@ -465,13 +509,14 @@ mod tests {
             &mut handler,
             json!({
                 "type":"content_block_start",
+                "index":0,
                 "content_block":{"type":"tool_use","id":"tool_partial","name":"lookup"}
             }),
         )?;
         handle_value(
             &mut state,
             &mut handler,
-            json!({"type":"content_block_delta","delta":{"partial_json":"{\"query\":"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"partial_json":"{\"query\":"}}),
         )?;
         let err = handle_value(
             &mut state,
@@ -490,6 +535,121 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn truncated_sse_does_not_dispatch_pending_tool_call() -> Result<()> {
+        let tool_start = json!({
+            "type":"content_block_start",
+            "index":0,
+            "content_block":{
+                "type":"tool_use",
+                "id":"tool_side_effect",
+                "name":"side_effect",
+                "input":{}
+            }
+        });
+        let builder = sse_fixture_builder(&format!("data: {tool_start}\n\n")).await?;
+        let (mut handler, mut rx) = test_handler();
+
+        let err = claude_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("claude", "test-model"),
+        )
+        .await
+        .expect_err("EOF before content_block_stop and message_stop must fail");
+
+        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert!(handler.tool_calls().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncated_sse_does_not_dispatch_stopped_tool_call() -> Result<()> {
+        let events = [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{
+                    "type":"tool_use",
+                    "id":"tool_stopped",
+                    "name":"side_effect",
+                    "input":{}
+                }
+            }),
+            json!({"type":"content_block_stop","index":0}),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let builder = sse_fixture_builder(&body).await?;
+        let (mut handler, mut rx) = test_handler();
+
+        let err = claude_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("claude", "test-model"),
+        )
+        .await
+        .expect_err("EOF after content_block_stop but before message_stop must fail");
+
+        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert!(handler.tool_calls().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_stop_dispatches_stopped_tool_call_once() -> Result<()> {
+        let events = [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{
+                    "type":"tool_use",
+                    "id":"tool_complete",
+                    "name":"side_effect",
+                    "input":{}
+                }
+            }),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let builder = sse_fixture_builder(&body).await?;
+        let (mut handler, _rx) = test_handler();
+
+        claude_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("claude", "test-model"),
+        )
+        .await?;
+
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "side_effect");
+        assert_eq!(calls[0].arguments, json!({}));
+        Ok(())
+    }
+
     #[test]
     fn successful_content_reasoning_and_tool_stream_is_unchanged() -> Result<()> {
         let (mut handler, _rx) = test_handler();
@@ -501,19 +661,21 @@ mod tests {
             json!({"type":"content_block_delta","delta":{"text":"answer"}}),
             json!({
                 "type":"content_block_start",
+                "index":1,
                 "content_block":{"type":"tool_use","id":"tool_one","name":"first"}
             }),
-            json!({"type":"content_block_delta","delta":{"partial_json":"{\"value\":1}"}}),
-            json!({"type":"content_block_stop"}),
+            json!({"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"value\":1}"}}),
+            json!({"type":"content_block_stop","index":1}),
             json!({
                 "type":"content_block_start",
+                "index":2,
                 "content_block":{"type":"tool_use","id":"tool_two","name":"second"}
             }),
-            json!({"type":"content_block_stop"}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"message_stop"}),
         ] {
             handle_value(&mut state, &mut handler, value)?;
         }
-        state.finish_tool_call(&mut handler)?;
 
         let (text, calls) = handler.take();
         assert_eq!(text, "<think>\nreason\n</think>\n\nanswer");

@@ -104,12 +104,15 @@ where
                     data: message.data,
                 };
                 if handle(message)? {
-                    break;
+                    es.close();
+                    return Ok(());
                 }
             }
             Err(err) => {
                 match err {
-                    EventSourceError::StreamEnded => {}
+                    EventSourceError::StreamEnded => {
+                        bail!("SSE stream ended before protocol completion");
+                    }
                     EventSourceError::InvalidStatusCode(status, res) => {
                         let text = res.text().await?;
                         let data: Value = match text.parse() {
@@ -138,7 +141,38 @@ where
             }
         }
     }
-    Ok(())
+    bail!("SSE stream ended before protocol completion")
+}
+
+#[cfg(test)]
+pub(crate) async fn sse_fixture_builder(body: &str) -> Result<RequestBuilder> {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("fixture accept failed");
+        let mut request = [0; 4096];
+        let request_len = socket
+            .read(&mut request)
+            .await
+            .expect("fixture request read failed");
+        assert!(request_len > 0, "fixture received an empty request");
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("fixture response write failed");
+        socket.shutdown().await.expect("fixture shutdown failed");
+    });
+
+    Ok(reqwest::Client::new().get(format!("http://{address}")))
 }
 
 pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
