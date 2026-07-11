@@ -117,72 +117,168 @@ async fn chat_completions(
     extract_chat_completions(&data)
 }
 
+#[derive(Debug, Default)]
+struct CohereStreamState {
+    tool_call: Option<PendingCohereToolCall>,
+    completed_tool_calls: Vec<ToolCall>,
+}
+
+impl CohereStreamState {
+    fn finish_tool_call(&mut self, index: u64) -> Result<()> {
+        let tool_call = self
+            .tool_call
+            .take()
+            .context("Cohere tool-call-end arrived without tool-call-start")?;
+        if tool_call.index != index {
+            bail!(
+                "Cohere tool call {} ended by index {index}",
+                tool_call.index
+            );
+        }
+        self.completed_tool_calls.push(tool_call.into_tool_call()?);
+        Ok(())
+    }
+
+    fn finish_message(&mut self, handler: &mut SseHandler, terminal: &str) -> Result<()> {
+        if let Some(tool_call) = self.tool_call.as_ref() {
+            bail!(
+                "Cohere {terminal} arrived before tool-call-end for index {}",
+                tool_call.index
+            );
+        }
+        for tool_call in std::mem::take(&mut self.completed_tool_calls) {
+            handler.tool_call(tool_call)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingCohereToolCall {
+    index: u64,
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl PendingCohereToolCall {
+    fn into_tool_call(self) -> Result<ToolCall> {
+        let arguments: Value = self.arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' have non-JSON arguments '{}'",
+                self.name, self.arguments
+            )
+        })?;
+        Ok(ToolCall::new(self.name, arguments, Some(self.id)))
+    }
+}
+
+fn handle_cohere_stream_message(
+    state: &mut CohereStreamState,
+    handler: &mut SseHandler,
+    message: &str,
+) -> Result<bool> {
+    if message == "[DONE]" {
+        state.finish_message(handler, "[DONE]")?;
+        return Ok(true);
+    }
+
+    let data: Value = serde_json::from_str(message).context("Invalid Cohere streaming response")?;
+    debug!("stream-data: {data}");
+    let Some(typ) = data["type"].as_str() else {
+        return Ok(false);
+    };
+
+    match typ {
+        "content-delta" => {
+            if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
+                handler.text(text)?;
+            }
+        }
+        "tool-plan-delta" => {
+            if let Some(text) = data["delta"]["message"]["tool_plan"].as_str() {
+                handler.text(text)?;
+            }
+        }
+        "tool-call-start" => {
+            if let Some(tool_call) = state.tool_call.as_ref() {
+                bail!(
+                    "Cohere started a new tool call before tool-call-end for index {}",
+                    tool_call.index
+                );
+            }
+            let index = data["index"]
+                .as_u64()
+                .context("Cohere tool-call-start is missing an index")?;
+            let call = &data["delta"]["message"]["tool_calls"];
+            let id = call["id"]
+                .as_str()
+                .context("Cohere tool-call-start is missing an id")?;
+            let name = call["function"]["name"]
+                .as_str()
+                .context("Cohere tool-call-start is missing a function name")?;
+            state.tool_call = Some(PendingCohereToolCall {
+                index,
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: String::new(),
+            });
+        }
+        "tool-call-delta" => {
+            let index = data["index"]
+                .as_u64()
+                .context("Cohere tool-call-delta is missing an index")?;
+            let tool_call = state
+                .tool_call
+                .as_mut()
+                .context("Cohere tool-call-delta arrived without tool-call-start")?;
+            if tool_call.index != index {
+                bail!(
+                    "Cohere tool call {} received a delta for index {index}",
+                    tool_call.index
+                );
+            }
+            let arguments = data["delta"]["message"]["tool_calls"]["function"]["arguments"]
+                .as_str()
+                .context("Cohere tool-call-delta is missing arguments")?;
+            tool_call.arguments.push_str(arguments);
+        }
+        "tool-call-end" => {
+            let index = data["index"]
+                .as_u64()
+                .context("Cohere tool-call-end is missing an index")?;
+            state.finish_tool_call(index)?;
+        }
+        "message-end" => {
+            let finish_reason = data["delta"]["finish_reason"]
+                .as_str()
+                .context("Cohere message-end is missing a finish_reason")?;
+            if matches!(finish_reason, "ERROR" | "TIMEOUT") {
+                bail!("Cohere streaming request ended with {finish_reason}");
+            }
+            if !state.completed_tool_calls.is_empty() && finish_reason != "TOOL_CALL" {
+                bail!(
+                    "Cohere message-end used finish_reason {finish_reason} for completed tool calls"
+                );
+            }
+            state.finish_message(handler, "message-end")?;
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let handle = |message: SseMmessage| -> Result<bool> {
-        if message.data == "[DONE]" {
-            return Ok(true);
-        }
-        let data: Value = serde_json::from_str(&message.data)?;
-        debug!("stream-data: {data}");
-        if let Some(typ) = data["type"].as_str() {
-            match typ {
-                "content-delta" => {
-                    if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
-                        handler.text(text)?;
-                    }
-                }
-                "tool-plan-delta" => {
-                    if let Some(text) = data["delta"]["message"]["tool_plan"].as_str() {
-                        handler.text(text)?;
-                    }
-                }
-                "tool-call-start" => {
-                    if let (Some(function), Some(id)) = (
-                        data["delta"]["message"]["tool_calls"]["function"].as_object(),
-                        data["delta"]["message"]["tool_calls"]["id"].as_str(),
-                    ) {
-                        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                            function_name = name.to_string();
-                        }
-                        function_id = id.to_string();
-                    }
-                }
-                "tool-call-delta" => {
-                    if let Some(text) =
-                        data["delta"]["message"]["tool_calls"]["function"]["arguments"].as_str()
-                    {
-                        function_arguments.push_str(text);
-                    }
-                }
-                "tool-call-end" => {
-                    if !function_name.is_empty() {
-                        let arguments: Value = function_arguments.parse().with_context(|| {
-                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                        })?;
-                        handler.tool_call(ToolCall::new(
-                            function_name.clone(),
-                            arguments,
-                            Some(function_id.clone()),
-                        ))?;
-                    }
-                    function_name.clear();
-                    function_arguments.clear();
-                    function_id.clear();
-                }
-                _ => {}
-            }
-        }
-        Ok(false)
-    };
-
-    sse_stream(builder, handle).await
+    let mut state = CohereStreamState::default();
+    sse_stream(builder, |message: SseMmessage| {
+        handle_cohere_stream_message(&mut state, handler, &message.data)
+    })
+    .await
 }
 
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
@@ -255,7 +351,50 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
 mod tests {
     use super::*;
 
+    use crate::utils::create_abort_signal;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
     const MISSING_API_BASE_ENV: &str = "AICHAT_TEST_MISSING_COHERE_API_BASE_04BB6F78";
+
+    fn test_handler() -> (SseHandler, UnboundedReceiver<SseEvent>) {
+        let (tx, rx) = unbounded_channel();
+        (SseHandler::new(tx, create_abort_signal()), rx)
+    }
+
+    fn official_sse_body(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|event| {
+                let typ = event["type"].as_str().expect("fixture event type");
+                format!("event: {typ}\ndata: {event}\n\n")
+            })
+            .collect()
+    }
+
+    fn tool_call_events() -> [Value; 4] {
+        [
+            json!({
+                "type":"message-start",
+                "id":"message-tool",
+                "delta":{"message":{"role":"assistant","content":[],"tool_plan":"","tool_calls":[],"citations":[]}}
+            }),
+            json!({
+                "type":"tool-call-start",
+                "index":0,
+                "delta":{"message":{"tool_calls":{
+                    "id":"call-side-effect",
+                    "type":"function",
+                    "function":{"name":"side_effect","arguments":""}
+                }}}
+            }),
+            json!({
+                "type":"tool-call-delta",
+                "index":0,
+                "delta":{"message":{"tool_calls":{"function":{"arguments":"{}"}}}}
+            }),
+            json!({"type":"tool-call-end","index":0}),
+        ]
+    }
 
     fn request_client(api_base: Option<String>) -> CohereClient {
         CohereClient {
@@ -321,5 +460,133 @@ mod tests {
         assert_eq!(chat.unwrap().url, "https://api.cohere.ai/v2/chat");
         assert_eq!(embeddings.unwrap().url, "https://api.cohere.ai/v2/embed");
         assert_eq!(rerank.unwrap().url, "https://api.cohere.ai/v2/rerank");
+    }
+
+    #[tokio::test]
+    async fn official_content_stream_completes_on_message_end() -> Result<()> {
+        let body = official_sse_body(&[
+            json!({
+                "type":"message-start",
+                "id":"message-content",
+                "delta":{"message":{"role":"assistant"}}
+            }),
+            json!({
+                "type":"content-start",
+                "index":0,
+                "delta":{"message":{"content":{"text":"","type":"text"}}}
+            }),
+            json!({
+                "type":"content-delta",
+                "index":0,
+                "delta":{"message":{"content":{"text":"hello"}}}
+            }),
+            json!({"type":"content-end","index":0}),
+            json!({
+                "type":"message-end",
+                "delta":{
+                    "finish_reason":"COMPLETE",
+                    "usage":{"billed_units":{"input_tokens":1,"output_tokens":1}}
+                }
+            }),
+        ]);
+        let builder = sse_fixture_builder(&body).await?;
+        let (mut handler, _rx) = test_handler();
+
+        chat_completions_streaming(builder, &mut handler, &Model::new("cohere", "test-model"))
+            .await?;
+
+        let (text, calls) = handler.take();
+        assert_eq!(text, "hello");
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn official_tool_stream_dispatches_once_at_message_end() -> Result<()> {
+        let mut events = tool_call_events().to_vec();
+        events.push(json!({
+            "type":"message-end",
+            "delta":{
+                "finish_reason":"TOOL_CALL",
+                "usage":{"billed_units":{"input_tokens":1,"output_tokens":1}}
+            }
+        }));
+        let builder = sse_fixture_builder(&official_sse_body(&events)).await?;
+        let (mut handler, _rx) = test_handler();
+
+        chat_completions_streaming(builder, &mut handler, &Model::new("cohere", "test-model"))
+            .await?;
+
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "side_effect");
+        assert_eq!(calls[0].arguments, json!({}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eof_before_message_end_does_not_dispatch_stopped_tool_call() -> Result<()> {
+        let builder = sse_fixture_builder(&official_sse_body(&tool_call_events())).await?;
+        let (mut handler, mut rx) = test_handler();
+
+        let err = chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("cohere", "test-model"),
+        )
+        .await
+        .expect_err("EOF before message-end must fail");
+
+        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert!(handler.tool_calls().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_end_before_tool_call_end_fails_closed() -> Result<()> {
+        let mut events = tool_call_events()[..3].to_vec();
+        events.push(json!({
+            "type":"message-end",
+            "delta":{"finish_reason":"TOOL_CALL"}
+        }));
+        let builder = sse_fixture_builder(&official_sse_body(&events)).await?;
+        let (mut handler, _rx) = test_handler();
+
+        let err = chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("cohere", "test-model"),
+        )
+        .await
+        .expect_err("message-end before tool-call-end must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Cohere message-end arrived before tool-call-end for index 0"
+        );
+        assert!(handler.tool_calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_done_marker_remains_a_completion_signal() -> Result<()> {
+        let builder = sse_fixture_builder("data: [DONE]\n\n").await?;
+        let (mut handler, _rx) = test_handler();
+
+        chat_completions_streaming(builder, &mut handler, &Model::new("cohere", "test-model"))
+            .await?;
+
+        let (text, calls) = handler.take();
+        assert!(text.is_empty());
+        assert!(calls.is_empty());
+        Ok(())
     }
 }
