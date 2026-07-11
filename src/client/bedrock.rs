@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use reqwest::{Client as ReqwestClient, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fmt::Write;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BedrockConfig {
@@ -38,14 +39,6 @@ impl BedrockClient {
         ("region", "AWS Region", None),
     ];
 
-    fn encode_model_name_if_needed(model_name: &str) -> String {
-        if model_name.contains('%') {
-            model_name.to_string()
-        } else {
-            urlencoding::encode(model_name).into_owned()
-        }
-    }
-
     fn chat_completions_builder(
         &self,
         client: &ReqwestClient,
@@ -57,12 +50,10 @@ impl BedrockClient {
         let session_token = self.get_session_token().ok();
         let host = format!("bedrock-runtime.{region}.amazonaws.com");
 
-        let model_name = Self::encode_model_name_if_needed(self.model.real_name());
-
         let uri = if data.stream {
-            format!("/model/{model_name}/converse-stream")
+            bedrock_model_uri(self.model.real_name(), "converse-stream")
         } else {
-            format!("/model/{model_name}/converse")
+            bedrock_model_uri(self.model.real_name(), "converse")
         };
 
         let body = build_chat_completions_body(data, &self.model)?;
@@ -108,8 +99,7 @@ impl BedrockClient {
         let session_token = self.get_session_token().ok();
         let host = format!("bedrock-runtime.{region}.amazonaws.com");
 
-        let model_name = Self::encode_model_name_if_needed(self.model.real_name());
-        let uri = format!("/model/{}/invoke", model_name);
+        let uri = bedrock_model_uri(self.model.real_name(), "invoke");
 
         let input_type = match data.query {
             true => "search_query",
@@ -325,6 +315,47 @@ async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
 #[derive(Deserialize)]
 struct EmbeddingsResBody {
     embeddings: Vec<Vec<f32>>,
+}
+
+fn bedrock_model_uri(model_name: &str, operation: &str) -> String {
+    let model_name = canonical_model_path_segment(model_name);
+    format!("/model/{model_name}/{operation}")
+}
+
+fn canonical_model_path_segment(model_name: &str) -> String {
+    let bytes = model_name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    let mut encoded = String::with_capacity(decoded.len());
+    for byte in decoded {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Result<Value> {
@@ -600,7 +631,7 @@ fn aws_fetch(
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         method,
-        encode_uri(&uri),
+        canonical_request_uri(&uri),
         querystring,
         canonical_headers,
         signed_headers,
@@ -644,9 +675,80 @@ fn aws_fetch(
     Ok(request_builder)
 }
 
+fn canonical_request_uri(uri: &str) -> String {
+    encode_uri(uri)
+}
+
 fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac_sha256(format!("AWS4{key}").as_bytes(), date_stamp);
     let k_region = hmac_sha256(&k_date, region);
     let k_service = hmac_sha256(&k_region, service);
     hmac_sha256(&k_service, "aws4_request")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_model_path_keeps_unreserved_ids_and_encodes_colons() {
+        assert_eq!(
+            canonical_model_path_segment("amazon.titan-text-express-v1"),
+            "amazon.titan-text-express-v1"
+        );
+        assert_eq!(
+            canonical_model_path_segment("amazon.titan-embed-text-v2:0"),
+            "amazon.titan-embed-text-v2%3A0"
+        );
+    }
+
+    #[test]
+    fn canonical_model_path_normalizes_raw_preencoded_and_mixed_arns() {
+        let raw = "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0";
+        let encoded = "arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Ainference-profile%2Fus.anthropic.claude-3-5-sonnet-20241022-v2%3A0";
+        let mixed = "arn%3Aaws:bedrock%3Aus-east-1:123456789012%3Ainference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0";
+
+        assert_eq!(canonical_model_path_segment(raw), encoded);
+        assert_eq!(canonical_model_path_segment(encoded), encoded);
+        assert_eq!(canonical_model_path_segment(mixed), encoded);
+    }
+
+    #[test]
+    fn canonical_model_path_handles_invalid_and_double_encoded_percent_sequences() {
+        assert_eq!(
+            canonical_model_path_segment("model%2Fvariant%GG%"),
+            "model%2Fvariant%25GG%25"
+        );
+        assert_eq!(canonical_model_path_segment("model%252Fvariant"), "model%252Fvariant");
+        assert_eq!(canonical_model_path_segment("模型"), "%E6%A8%A1%E5%9E%8B");
+    }
+
+    #[test]
+    fn all_bedrock_operations_share_the_same_model_path() {
+        let model = "provider/model:1";
+
+        assert_eq!(
+            bedrock_model_uri(model, "converse"),
+            "/model/provider%2Fmodel%3A1/converse"
+        );
+        assert_eq!(
+            bedrock_model_uri(model, "converse-stream"),
+            "/model/provider%2Fmodel%3A1/converse-stream"
+        );
+        assert_eq!(
+            bedrock_model_uri(model, "invoke"),
+            "/model/provider%2Fmodel%3A1/invoke"
+        );
+    }
+
+    #[test]
+    fn endpoint_and_sigv4_paths_derive_from_one_canonical_uri() {
+        let endpoint_uri = bedrock_model_uri("provider/model:1", "converse");
+
+        assert_eq!(endpoint_uri, "/model/provider%2Fmodel%3A1/converse");
+        assert_eq!(
+            canonical_request_uri(&endpoint_uri),
+            "/model/provider%252Fmodel%253A1/converse"
+        );
+    }
 }
