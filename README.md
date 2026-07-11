@@ -12,10 +12,10 @@ AIChat is an all-in-one LLM CLI tool featuring Shell Assistant, CMD & REPL Mode,
 
 - **Rust Developers:** `cargo install aichat`
 - **Homebrew/Linuxbrew Users:** `brew install aichat`
-- **[Mise](https://github.com/jdx/mise) Users:** `mise use -g aichat`
+- **[mise](https://mise.jdx.dev/) Users:** `mise use --global aqua:sigoden/aichat@latest`
 - **Pacman Users**: `pacman -S aichat`
 - **Windows Scoop Users:** `scoop install aichat`
-- **Windows WinGet Users:** `winget install aichat`
+- **Windows WinGet Users:** `winget install --exact --id sigoden.AIChat`
 - **Android Termux Users:** `pkg install aichat`
 
 ### Pre-built Binaries
@@ -38,6 +38,8 @@ Explore powerful command-line functionalities with AIChat's CMD mode.
 
 Experience an interactive Chat-REPL with features like tab autocompletion, multi-line input support, history search, configurable keybindings, and custom REPL prompts.
 
+Editor commands from the `editor` configuration, `VISUAL`, or `EDITOR` may include arguments. They use POSIX shell-word quoting on every platform, so executable paths containing spaces must be quoted, for example `"C:\Program Files\Helix\hx.exe" --wait`.
+
 ![aichat-repl](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
 
 ### Shell Assistant
@@ -56,6 +58,7 @@ Accept diverse input forms such as stdin, local files and directories, and remot
 | STDIN             | `cat data.txt \| aichat`             |                                  |
 | Last Reply        |                                      | `.file %%`                       |
 | Local files       | `aichat -f image.png -f data.txt`    | `.file image.png data.txt`       |
+| Shell-expanded files | `aichat --files src/*.rs -- explain` | `.file src/a.rs src/b.rs -- explain` |
 | Local directories | `aichat -f dir/`                     | `.file dir/`                     |
 | Remote URLs       | `aichat -f https://example.com`      | `.file https://example.com`      |
 | External commands | ```aichat -f '`git diff`'```         | ```.file `git diff` ```          |
@@ -107,7 +110,7 @@ AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
 
 ![aichat-agent](https://github.com/user-attachments/assets/0b7e687d-e642-4e8a-b1c1-d2d9b2da2b6b)
 
-A minimal local agent requires both an agent definition and an entry in `agents.txt` under the functions directory. The agent-specific `config.yaml` is optional and only overrides runtime configuration such as model, temperature, or default variables.
+A minimal local agent requires an agent definition and an entry in `agents.txt` under the functions directory. The agent-specific `config.yaml` is optional and only overrides runtime configuration such as the model, temperature, or default variables.
 
 ```text
 <aichat-config-dir>/
@@ -137,7 +140,7 @@ instructions: |
   You are a concise assistant for this project.
 ```
 
-After creating these files, run `aichat --list-agents` to confirm the agent is discoverable, then use it with `aichat -a my-agent`.
+After creating these files, run `aichat --list-agents` to confirm that the agent is discoverable, then use it with `aichat -a my-agent`.
 
 ### Local Server Capabilities
 
