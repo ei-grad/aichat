@@ -72,9 +72,9 @@
       max_batch_size: 100
 
 # Links:
-#  - https://ai.google.dev/models/gemini
-#  - https://ai.google.dev/pricing
-#  - https://ai.google.dev/api/rest/v1beta/models/streamGenerateContent
+#  - https://ai.google.dev/gemini-api/docs/models
+#  - https://ai.google.dev/gemini-api/docs/pricing
+#  - https://ai.google.dev/gemini-api/docs/deprecations
 - provider: gemini
   models:
     - name: gemini-2.5-flash
@@ -98,24 +98,21 @@
       output_price: 0
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-3-pro-preview
+    - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
+      max_output_tokens: 65536
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-3-flash-preview
+    - name: gemini-3.5-flash
       max_input_tokens: 1048576
-      supports_vision: true
-      supports_function_calling: true
-    - name: gemini-2.0-flash
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
+      max_output_tokens: 65536
       input_price: 0
       output_price: 0
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-2.0-flash-lite
+    - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
-      max_output_tokens: 8192
+      max_output_tokens: 65536
       input_price: 0
       output_price: 0
       supports_vision: true
@@ -125,18 +122,39 @@
       max_output_tokens: 8192
       input_price: 0
       output_price: 0
-    - name: text-embedding-004
-      type: embedding
-      input_price: 0
-      max_tokens_per_chunk: 2048
-      default_chunk_size: 1500
-      max_batch_size: 100
 
 # Links:
-#  - https://docs.anthropic.com/en/docs/about-claude/models/all-models
-#  - https://docs.anthropic.com/en/api/messages
+#  - https://platform.claude.com/docs/en/about-claude/models/overview
+#  - https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
 - provider: claude
   models:
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: claude-opus-4-7:thinking
+      real_name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          thinking:
+            type: adaptive
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -484,9 +502,9 @@
       output_price: 0
 
 # Links:
-#  - https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
-#  - https://cloud.google.com/vertex-ai/generative-ai/pricing
-#  - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini
+#  - https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions
+#  - https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
+#  - https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/opus-4-7
 - provider: vertexai
   models:
     - name: gemini-2.5-flash
@@ -510,28 +528,54 @@
       output_price: 0.4
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-3-pro-preview
+    - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 2
+      output_price: 12
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-3-flash-preview
+    - name: gemini-3.5-flash
       max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-2.0-flash-001
+    - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0.15
-      output_price: 0.6
+      max_output_tokens: 65536
+      input_price: 0.25
+      output_price: 1.5
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-2.0-flash-lite-001
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0.075
-      output_price: 0.3
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
       supports_vision: true
       supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: claude-opus-4-7:thinking
+      real_name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          thinking:
+            type: adaptive
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -666,9 +710,39 @@
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html#model-ids-arns
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-supported-models-features.html
 #  - https://aws.amazon.com/bedrock/pricing/
-#  - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html
+#  - https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html
 - provider: bedrock
   models:
+    - name: us.anthropic.claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          inferenceConfig:
+            temperature: null
+            topP: null
+    - name: us.anthropic.claude-opus-4-7:thinking
+      real_name: us.anthropic.claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          inferenceConfig:
+            temperature: null
+            topP: null
+          additionalModelRequestFields:
+            thinking:
+              type: adaptive
     - name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1080,55 +1154,96 @@
       max_batch_size: 100
 
 # Links:
-#  - https://platform.moonshot.cn/docs/pricing/chat#%E8%AE%A1%E8%B4%B9%E5%9F%BA%E6%9C%AC%E6%A6%82%E5%BF%B5
-#  - https://platform.moonshot.cn/docs/api/chat#%E5%85%AC%E5%BC%80%E7%9A%84%E6%9C%8D%E5%8A%A1%E5%9C%B0%E5%9D%80
+#  - https://platform.kimi.ai/docs/guide/start-using-kimi-api
+#  - https://platform.kimi.ai/docs/models
+- provider: moonshot_intl
+  models:
+    - name: kimi-k2.7-code
+      max_input_tokens: 262144
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: kimi-k2.7-code-highspeed
+      max_input_tokens: 262144
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: kimi-k2.6
+      max_input_tokens: 262144
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: kimi-k2.5
+      max_input_tokens: 262144
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+
+# Links:
+#  - https://platform.kimi.com/docs/api/overview
+#  - https://platform.kimi.com/docs/models
 - provider: moonshot
   models:
+    - name: kimi-k2.6
+      max_input_tokens: 262144
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
     - name: kimi-k2.5
       max_input_tokens: 262144
       input_price: 0.56
       output_price: 2.94
       supports_vision: true
       supports_function_calling: true
-    - name: kimi-k2-turbo-preview
-      max_input_tokens: 262144
-      input_price: 1.12
-      output_price: 8.12
-      supports_vision: true
-      supports_function_calling: true
-    - name: kimi-k2-0905-preview
-      max_input_tokens: 262144
-      input_price: 0.56
-      output_price: 2.24
-      supports_vision: true
-      supports_function_calling: true
-    - name: kimi-k2-thinking-turbo
-      max_input_tokens: 262144
-      input_price: 1.12
-      output_price: 8.12
-      supports_vision: true
-    - name: kimi-k2-thinking
-      max_input_tokens: 262144
-      input_price: 0.56
-      output_price: 2.24
-      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
 
 # Links:
 #  - https://api-docs.deepseek.com/quick_start/pricing
-#  - https://platform.deepseek.com/api-docs/api/create-chat-completion
+#  - https://api-docs.deepseek.com/news/news260424/
 - provider: deepseek
   models:
     - name: deepseek-chat
-      max_input_tokens: 64000
-      max_output_tokens: 8192
-      input_price: 0.56
-      output_price: 1.68
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.14
+      output_price: 0.28
       supports_function_calling: true
     - name: deepseek-reasoner
-      max_input_tokens: 64000
-      max_output_tokens: 32768
-      input_price: 0.56
-      output_price: 1.68
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.14
+      output_price: 0.28
+      supports_function_calling: true
+    - name: deepseek-v4-flash
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.14
+      output_price: 0.28
+      supports_function_calling: true
+    - name: deepseek-v4-pro
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.435
+      output_price: 0.87
+      supports_function_calling: true
 
 # Links:
 #  - https://open.bigmodel.cn/pricing
@@ -1182,34 +1297,45 @@
       input_price: 0.112
 
 # Links:
-# - https://platform.minimaxi.com/docs/guides/pricing-paygo
-# - https://platform.minimaxi.com/document/ChatCompletion%20v2
+# - https://platform.minimax.io/docs/api-reference/text-openai-api
+# - https://platform.minimax.io/docs/guides/pricing-paygo
 - provider: minimax
   models:
-    - name: minimax-m2.5
+    - name: MiniMax-M2.7
       max_input_tokens: 204800
-      input_price: 0.294
-      output_price: 1.176
+      input_price: 0.3
+      output_price: 1.2
       supports_function_calling: true
-    - name: minimax-m2.5-highspeed
+    - name: MiniMax-M2.7-highspeed
       max_input_tokens: 204800
-      input_price: 0.588
-      output_price: 2.352
+      input_price: 0.6
+      output_price: 2.4
       supports_function_calling: true
-    - name: minimax-m2.1
+    - name: MiniMax-M2.5
       max_input_tokens: 204800
-      input_price: 0.294
-      output_price: 1.176
+      input_price: 0.3
+      output_price: 1.2
       supports_function_calling: true
-    - name: minimax-m2.1-highspeed
+    - name: MiniMax-M2.5-highspeed
       max_input_tokens: 204800
-      input_price: 0.588
-      output_price: 2.352
+      input_price: 0.6
+      output_price: 2.4
+      supports_function_calling: true
+    - name: MiniMax-M2.1
+      max_input_tokens: 204800
+      input_price: 0.3
+      output_price: 1.2
+      supports_function_calling: true
+    - name: MiniMax-M2.1-highspeed
+      max_input_tokens: 204800
+      input_price: 0.6
+      output_price: 2.4
       supports_function_calling: true
 
 # Links:
 #  - https://openrouter.ai/models
 #  - https://openrouter.ai/docs/api-reference/chat-completion
+#  - https://openrouter.ai/docs/cookbook/evaluate-and-optimize/model-migrations/claude-4-7
 - provider: openrouter
   models:
     - name: openai/gpt-5.2
@@ -1296,6 +1422,33 @@
       max_input_tokens: 131072
       input_price: 0.1
       output_price: 0.2
+    - name: anthropic/claude-opus-4.7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+    - name: anthropic/claude-opus-4.7:thinking
+      real_name: anthropic/claude-opus-4.7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          reasoning:
+            enabled: true
     - name: anthropic/claude-opus-4.6
       max_input_tokens: 200000
       max_output_tokens: 8192
