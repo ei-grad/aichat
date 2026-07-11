@@ -13,7 +13,8 @@ use crate::config::{
 };
 use crate::render::render_error;
 use crate::utils::{
-    abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file, AbortSignal,
+    abortable_run_with_spinner, create_abort_signal, dimmed_text, editor_command, set_text,
+    temp_file, AbortSignal,
 };
 
 use anyhow::{bail, Context, Result};
@@ -26,8 +27,8 @@ use reedline::{
     ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
 };
 use reedline::{MenuBuilder, Signal};
+use std::env;
 use std::sync::LazyLock;
-use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
@@ -284,13 +285,7 @@ Type ".help" for additional help.
 
         if let Ok(cmd) = config.read().editor() {
             let temp_file = temp_file("-repl-", ".md");
-            let parts = shell_words::split(&cmd)
-                .with_context(|| format!("Invalid editor command '{cmd}'"))?;
-            let (program, args) = parts
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("Invalid editor command '{cmd}'"))?;
-            let mut command = process::Command::new(program);
-            command.args(args);
+            let command = editor_command(&cmd)?;
             editor = editor.with_buffer_editor(command, temp_file);
         }
 

@@ -193,65 +193,71 @@ fn replace_loader_placeholders(template: &str, path: &str, outpath: &str) -> (St
     (result, has_outpath)
 }
 
-pub fn default_editor() -> String {
-    if cfg!(windows) {
-        "notepad".to_string()
-    } else {
-        "nano".to_string()
-    }
-}
-
-pub fn editor_program_exists(editor: &str) -> bool {
-    let Ok(parts) = shell_words::split(editor) else {
-        return false;
-    };
-    let Some(program) = parts.first() else {
-        return false;
-    };
-    let path = Path::new(program);
-    if path.is_absolute() {
-        return path.is_file();
-    }
-    which::which(program).is_ok()
-}
-
-pub fn resolve_editor(config_editor: Option<&str>) -> Result<String> {
-    let config_editor = config_editor
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let visual = env::var("VISUAL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let editor_env = env::var("EDITOR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    let explicit = config_editor
-        .or(visual.as_deref())
-        .or(editor_env.as_deref());
-
-    let editor = explicit.map(str::to_string).unwrap_or_else(default_editor);
-
-    if explicit.is_none() && !editor_program_exists(&editor) {
+pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
+    let mut command = editor_command(editor)?;
+    let mut child = command
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("Unable to start editor `{editor}` for '{}'", path.display()))?;
+    let status = child.wait().with_context(|| {
+        format!(
+            "Unable to wait for editor `{editor}` while editing '{}'",
+            path.display()
+        )
+    })?;
+    if !status.success() {
         bail!(
-            "Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."
-        );
+            "Editor `{editor}` exited with {status} while editing '{}'",
+            path.display()
+        )
+    }
+    Ok(())
+}
+
+pub fn editor_command(editor: &str) -> Result<Command> {
+    let args = parse_editor_command(editor)?;
+    let (program, args) = args
+        .split_first()
+        .ok_or_else(|| anyhow!("Editor command is empty"))?;
+    let mut command = Command::new(program);
+    command.args(args);
+    Ok(command)
+}
+
+pub fn resolve_editor_command<F>(
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+    default: &str,
+    executable_exists: F,
+) -> Result<String>
+where
+    F: FnOnce(&str) -> bool,
+{
+    let editor = [configured, visual, editor]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or(default)
+        .to_string();
+    let args = parse_editor_command(&editor)?;
+    let program = args
+        .first()
+        .ok_or_else(|| anyhow!("Editor command is empty"))?;
+    if !executable_exists(program) {
+        bail!("Editor executable '{program}' from `{editor}` was not found")
     }
     Ok(editor)
 }
 
-pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
-    let parts =
-        shell_words::split(editor).with_context(|| format!("Invalid editor command '{editor}'"))?;
-    let (program, args) = parts
-        .split_first()
-        .ok_or_else(|| anyhow!("Invalid editor command '{editor}'"))?;
-    let mut child = Command::new(program).args(args).arg(path).spawn()?;
-    child.wait()?;
-    Ok(())
+fn parse_editor_command(editor: &str) -> Result<Vec<String>> {
+    // Use one grammar on every platform and invoke the program directly, without a shell. Quoting
+    // is therefore deterministic and shell operators are ordinary arguments.
+    shell_words::split(editor).with_context(|| {
+        format!(
+            "Invalid editor command `{editor}`; use POSIX shell-word quoting, including on Windows"
+        )
+    })
 }
 
 pub fn append_to_shell_history(shell: &str, command: &str, exit_code: i32) -> io::Result<()> {
@@ -326,6 +332,73 @@ fn get_history_file(shell: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn editor_command_accepts_arguments() {
+        edit_file("/bin/sh -c true", Path::new("/dev/null")).unwrap();
+    }
+
+    #[test]
+    fn editor_resolution_has_deterministic_priority() {
+        let found = |program: &str| program == "configured";
+        let editor = resolve_editor_command(
+            Some("configured --wait"),
+            Some("visual"),
+            Some("editor"),
+            "default",
+            found,
+        )
+        .unwrap();
+        assert_eq!(editor, "configured --wait");
+
+        let editor = resolve_editor_command(
+            Some("  "),
+            Some("visual --wait"),
+            Some("editor"),
+            "default",
+            |program| program == "visual",
+        )
+        .unwrap();
+        assert_eq!(editor, "visual --wait");
+
+        let editor = resolve_editor_command(None, None, Some("editor"), "default", |program| {
+            program == "editor"
+        })
+        .unwrap();
+        assert_eq!(editor, "editor");
+
+        let editor =
+            resolve_editor_command(None, None, None, "default", |program| program == "default")
+                .unwrap();
+        assert_eq!(editor, "default");
+    }
+
+    #[test]
+    fn editor_parser_supports_quoted_paths_on_all_platforms() {
+        let args = parse_editor_command(r#""C:\Program Files\Helix\hx.exe" --wait"#).unwrap();
+        assert_eq!(args, [r"C:\Program Files\Helix\hx.exe", "--wait"]);
+    }
+
+    #[test]
+    fn editor_parser_rejects_malformed_quotes() {
+        let error = parse_editor_command("helix '").unwrap_err();
+        assert!(error.to_string().contains("Invalid editor command"));
+        assert!(error.to_string().contains("POSIX shell-word quoting"));
+    }
+
+    #[test]
+    fn editor_resolution_reports_missing_executable() {
+        let error =
+            resolve_editor_command(None, Some("missing-editor --wait"), None, "default", |_| {
+                false
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Editor executable 'missing-editor' from `missing-editor --wait` was not found"
+        );
+    }
+
     #[test]
     fn loader_path_prevents_leading_dash_options() {
         assert_eq!(sanitize_loader_path("-v"), "./-v");
@@ -382,84 +455,5 @@ mod tests {
         let (args, has_outpath) = expand_loader_placeholders(args, windows_path, "/tmp/output");
         assert_eq!(args, vec!["loader", windows_path, "/tmp/output"]);
         assert!(has_outpath);
-    }
-}
-
-#[cfg(test)]
-mod editor_tests {
-    use super::*;
-
-    #[test]
-    fn editor_program_exists_for_absolute_path() {
-        assert!(editor_program_exists("/bin/sh"));
-        assert!(!editor_program_exists("/definitely/not/an/editor"));
-    }
-
-    #[test]
-    fn editor_program_exists_uses_first_token() {
-        assert!(editor_program_exists("sh -c true"));
-    }
-
-    #[test]
-    fn resolve_editor_prefers_config_over_env() {
-        let previous_editor = env::var("EDITOR").ok();
-        let previous_visual = env::var("VISUAL").ok();
-        env::set_var("EDITOR", "nano");
-        env::set_var("VISUAL", "nano");
-
-        let resolved = resolve_editor(Some("vim")).expect("config editor should resolve");
-
-        if let Some(value) = previous_editor {
-            env::set_var("EDITOR", value);
-        } else {
-            env::remove_var("EDITOR");
-        }
-        if let Some(value) = previous_visual {
-            env::set_var("VISUAL", value);
-        } else {
-            env::remove_var("VISUAL");
-        }
-
-        assert_eq!(resolved, "vim");
-    }
-
-    #[test]
-    fn resolve_editor_uses_editor_env_when_config_missing() {
-        let previous_editor = env::var("EDITOR").ok();
-        let previous_visual = env::var("VISUAL").ok();
-        env::remove_var("VISUAL");
-        env::set_var("EDITOR", "  vim  ");
-
-        let resolved = resolve_editor(None).expect("EDITOR should be used");
-
-        if let Some(value) = previous_editor {
-            env::set_var("EDITOR", value);
-        } else {
-            env::remove_var("EDITOR");
-        }
-        if let Some(value) = previous_visual {
-            env::set_var("VISUAL", value);
-        } else {
-            env::remove_var("VISUAL");
-        }
-
-        assert_eq!(resolved, "vim");
-    }
-
-    #[test]
-    fn resolve_editor_ignores_blank_config_values() {
-        let previous_editor = env::var("EDITOR").ok();
-        env::set_var("EDITOR", "vim");
-
-        let resolved =
-            resolve_editor(Some("   ")).expect("blank config should fall back to EDITOR");
-
-        if let Some(value) = previous_editor {
-            env::set_var("EDITOR", value);
-        } else {
-            env::remove_var("EDITOR");
-        }
-
-        assert_eq!(resolved, "vim");
     }
 }
