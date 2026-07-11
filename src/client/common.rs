@@ -16,6 +16,7 @@ use inquire::{
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
@@ -33,6 +34,86 @@ static EMBEDDING_MODEL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static ESCAPE_SLASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?<!\\)/").unwrap());
+
+enum ConfigFieldValue<'a> {
+    Env(&'a str),
+    Literal(Cow<'a, str>),
+}
+
+fn parse_config_field_value<'a>(field_name: &str, value: &'a str) -> Result<ConfigFieldValue<'a>> {
+    if let Some(value) = value.strip_prefix("$$") {
+        return Ok(ConfigFieldValue::Literal(Cow::Owned(format!("${value}"))));
+    }
+    if !value.starts_with('$') {
+        return Ok(ConfigFieldValue::Literal(Cow::Borrowed(value)));
+    }
+
+    let env_name = if let Some(value) = value.strip_prefix("${") {
+        value.strip_suffix('}')
+    } else {
+        value.strip_prefix('$')
+    };
+    let Some(env_name) = env_name.filter(|name| is_valid_env_name(name)) else {
+        bail!("Invalid environment reference for '{field_name}'");
+    };
+    Ok(ConfigFieldValue::Env(env_name))
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+        && chars.all(|ch| matches!(ch, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
+}
+
+pub(crate) fn resolve_config_field(
+    client_name: &str,
+    field_name: &str,
+    value: Option<&str>,
+    env_aliases: &[&str],
+) -> Result<String> {
+    resolve_config_field_with(client_name, field_name, value, env_aliases, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+fn resolve_config_field_with<F>(
+    client_name: &str,
+    field_name: &str,
+    value: Option<&str>,
+    env_aliases: &[&str],
+    env_lookup: F,
+) -> Result<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = value
+        .map(|value| parse_config_field_value(field_name, value))
+        .transpose()?;
+
+    if let Some(ConfigFieldValue::Env(env_name)) = value.as_ref() {
+        return env_lookup(env_name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Environment variable for '{field_name}' is missing or empty")
+            });
+    }
+
+    let primary_env = format!("{client_name}_{field_name}").to_ascii_uppercase();
+    for env_name in std::iter::once(primary_env.as_str()).chain(env_aliases.iter().copied()) {
+        if let Some(value) = env_lookup(env_name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(value);
+        }
+    }
+
+    if let Some(ConfigFieldValue::Literal(value)) = value {
+        return Ok(value.into_owned());
+    }
+    bail!("Miss '{field_name}'")
+}
 
 #[async_trait::async_trait]
 pub trait Client: Sync + Send {
@@ -680,6 +761,122 @@ fn prompt_input_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn resolve_with_env(
+        client_name: &str,
+        field_name: &str,
+        value: Option<&str>,
+        aliases: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<String> {
+        let env: HashMap<_, _> = env
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        resolve_config_field_with(client_name, field_name, value, aliases, |name| {
+            env.get(name).cloned()
+        })
+    }
+
+    #[test]
+    fn config_field_resolves_exact_environment_references() {
+        let env = [("DIRECT_KEY", "  secret\r\n")];
+
+        assert_eq!(
+            resolve_with_env("claude", "api_key", Some("$DIRECT_KEY"), &[], &env).unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            resolve_with_env("claude", "api_key", Some("${DIRECT_KEY}"), &[], &env).unwrap(),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn config_field_rejects_missing_empty_and_malformed_references() {
+        for value in ["$", "${}", "${KEY", "$KEY}", "$1KEY", "${KEY}-suffix"] {
+            let err = resolve_with_env("claude", "api_key", Some(value), &[], &[])
+                .expect_err("malformed reference must fail");
+            assert!(!err.to_string().contains(value));
+        }
+
+        for env in [&[][..], &[("DIRECT_KEY", " \r\n")][..]] {
+            let err = resolve_with_env("claude", "api_key", Some("$DIRECT_KEY"), &[], env)
+                .expect_err("missing or empty explicit reference must fail");
+            assert!(!err.to_string().contains("DIRECT_KEY"));
+        }
+    }
+
+    #[test]
+    fn config_field_precedence_and_literal_escape_are_deterministic() {
+        let env = [
+            ("DIRECT_KEY", "direct"),
+            ("CUSTOM_API_KEY", "primary"),
+            ("ANTHROPIC_API_KEY", "alias"),
+        ];
+
+        assert_eq!(
+            resolve_with_env(
+                "custom",
+                "api_key",
+                Some("$DIRECT_KEY"),
+                &["ANTHROPIC_API_KEY"],
+                &env,
+            )
+            .unwrap(),
+            "direct"
+        );
+        assert_eq!(
+            resolve_with_env(
+                "custom",
+                "api_key",
+                Some("literal"),
+                &["ANTHROPIC_API_KEY"],
+                &env,
+            )
+            .unwrap(),
+            "primary"
+        );
+        assert_eq!(
+            resolve_with_env("custom", "api_key", Some("$$DIRECT_KEY"), &[], &[]).unwrap(),
+            "$DIRECT_KEY"
+        );
+    }
+
+    #[test]
+    fn anthropic_alias_is_limited_to_claude_api_keys() {
+        let env = [("ANTHROPIC_API_KEY", " anthropic-key\n")];
+
+        assert_eq!(
+            resolve_with_env(
+                "custom-claude",
+                "api_key",
+                None,
+                &["ANTHROPIC_API_KEY"],
+                &env,
+            )
+            .unwrap(),
+            "anthropic-key"
+        );
+        assert!(resolve_with_env("custom-claude", "api_base", None, &[], &env,).is_err());
+        assert!(resolve_with_env("claude-openai-compatible", "api_key", None, &[], &env,).is_err());
+    }
+
+    #[test]
+    fn empty_conventional_environment_value_falls_back_to_literal() {
+        assert_eq!(
+            resolve_with_env(
+                "custom",
+                "api_key",
+                Some("literal"),
+                &[],
+                &[("CUSTOM_API_KEY", " \r\n")],
+            )
+            .unwrap(),
+            "literal"
+        );
+    }
 
     #[test]
     fn catch_error_recognizes_numeric_code_and_detail() {
