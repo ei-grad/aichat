@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 struct ProviderModels {
     provider: String,
+    api_base: Option<String>,
+    wire_format: Option<String>,
     models: Vec<ModelRecord>,
 }
 
@@ -471,6 +473,17 @@ fn catalog_schema_is_typed_and_only_preexisting_collision_remains() {
     for provider in &catalog {
         assert!(!provider.provider.is_empty());
         assert!(!provider.models.is_empty());
+        if let Some(api_base) = &provider.api_base {
+            assert!(
+                api_base.starts_with("https://"),
+                "non-https api_base for {}",
+                provider.provider
+            );
+        }
+        assert!(matches!(
+            provider.wire_format.as_deref(),
+            None | Some("openai" | "claude" | "gemini" | "cohere")
+        ));
         for model in &provider.models {
             assert!(!model.name.is_empty());
             assert!(matches!(

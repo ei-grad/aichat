@@ -34,7 +34,7 @@ impl_client_trait!(
     (
         prepare_chat_completions,
         openai_chat_completions,
-        openai_chat_completions_streaming
+        openai_chat_events
     ),
     (prepare_embeddings, openai_embeddings),
     (noop_prepare_rerank, noop_rerank),
@@ -97,34 +97,24 @@ pub async fn openai_chat_completions(
 }
 
 #[derive(Debug, Default)]
-struct OpenAiStreamState {
-    tool_calls: OpenAiToolCallAccumulator,
-    reasoning: bool,
-}
-
-impl OpenAiStreamState {
-    fn finish_tool_calls(&mut self, handler: &mut SseHandler) -> Result<()> {
-        let calls = std::mem::take(&mut self.tool_calls).finish()?;
-        for call in calls {
-            handler.tool_call(call)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Default)]
 struct OpenAiToolCallAccumulator {
     completed: Vec<PendingOpenAiToolCall>,
     active: IndexMap<u64, PendingOpenAiToolCall>,
 }
 
 impl OpenAiToolCallAccumulator {
-    fn push_delta(&mut self, index: u64, id: Option<&str>, function: Option<&serde_json::Map<String, Value>>) {
+    fn push_delta(
+        &mut self,
+        index: u64,
+        id: Option<&str>,
+        function: Option<&serde_json::Map<String, Value>>,
+    ) {
         // OpenAI sends an id only in the first delta. A different non-empty id on the
         // same index is the only reliable boundary for providers that reuse indexes.
-        let starts_new_call = self.active.get(&index).is_some_and(|pending| {
-            id.is_some_and(|id| !pending.id.is_empty() && pending.id != id)
-        });
+        let starts_new_call = self
+            .active
+            .get(&index)
+            .is_some_and(|pending| id.is_some_and(|id| !pending.id.is_empty() && pending.id != id));
         if starts_new_call {
             if let Some(previous) = self.active.shift_remove(&index) {
                 self.completed.push(previous);
@@ -199,12 +189,14 @@ impl PendingOpenAiToolCall {
 }
 
 fn handle_openai_stream_message(
-    state: &mut OpenAiStreamState,
-    handler: &mut SseHandler,
+    state: &mut OpenAiToolCallAccumulator,
+    events: &mut Vec<ChatEvent>,
     message: &str,
 ) -> Result<bool> {
     if message == "[DONE]" {
-        state.finish_tool_calls(handler)?;
+        for call in std::mem::take(state).finish()? {
+            events.push(ChatEvent::ToolCall(call));
+        }
         return Ok(true);
     }
 
@@ -214,49 +206,42 @@ fn handle_openai_stream_message(
         .as_str()
         .filter(|v| !v.is_empty())
     {
-        if state.reasoning {
-            handler.text("\n</think>\n\n")?;
-            state.reasoning = false;
-        }
-        handler.text(text)?;
+        events.push(ChatEvent::Text(text.to_string()));
     } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
         .as_str()
         .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
         .filter(|v| !v.is_empty())
     {
-        if !state.reasoning {
-            handler.text("<think>\n")?;
-            state.reasoning = true;
-        }
-        handler.text(text)?;
+        events.push(ChatEvent::Reasoning(text.to_string()));
     }
 
     if let Some(tool_calls) = data["choices"][0]["delta"]["tool_calls"].as_array() {
-        if !tool_calls.is_empty() && state.reasoning {
-            handler.text("\n</think>\n\n")?;
-            state.reasoning = false;
-        }
         for (position, call) in tool_calls.iter().enumerate() {
             let index = call["index"].as_u64().unwrap_or(position as u64);
             let id = call["id"].as_str().filter(|v| !v.is_empty());
-            state
-                .tool_calls
-                .push_delta(index, id, call["function"].as_object());
+            state.push_delta(index, id, call["function"].as_object());
         }
     }
     Ok(false)
 }
 
-pub async fn openai_chat_completions_streaming(
+pub async fn openai_chat_events(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatEventStream> {
+    let mut state = OpenAiToolCallAccumulator::default();
+    Ok(sse_chat_events(builder, move |message, events| {
+        handle_openai_stream_message(&mut state, events, &message.data)
+    }))
+}
+
+#[cfg(test)]
+async fn stream_into_handler(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    _model: &Model,
+    model: &Model,
 ) -> Result<()> {
-    let mut state = OpenAiStreamState::default();
-    sse_stream(builder, |message: SseMmessage| {
-        handle_openai_stream_message(&mut state, handler, &message.data)
-    })
-    .await
+    drive_chat_events(openai_chat_events(builder, model).await?, handler).await
 }
 
 pub async fn openai_embeddings(
@@ -482,11 +467,21 @@ mod tests {
     }
 
     fn handle_value(
-        state: &mut OpenAiStreamState,
-        handler: &mut SseHandler,
+        state: &mut OpenAiToolCallAccumulator,
+        events: &mut Vec<ChatEvent>,
         value: Value,
     ) -> Result<bool> {
-        handle_openai_stream_message(state, handler, &value.to_string())
+        handle_openai_stream_message(state, events, &value.to_string())
+    }
+
+    fn tool_calls(events: &[ChatEvent]) -> Vec<&ToolCall> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect()
     }
 
     fn completion_data(stream: bool) -> ChatCompletionsData {
@@ -531,10 +526,7 @@ mod tests {
         assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
         let client = request_client(Some(format!("${MISSING_API_BASE_ENV}")));
 
-        assert_api_base_reference_error(prepare_chat_completions(
-            &client,
-            completion_data(false),
-        ));
+        assert_api_base_reference_error(prepare_chat_completions(&client, completion_data(false)));
         assert_api_base_reference_error(prepare_embeddings(
             &client,
             &EmbeddingsData::new(vec!["hello".into()], false),
@@ -546,17 +538,11 @@ mod tests {
         let client = request_client(None);
 
         let chat = prepare_chat_completions(&client, completion_data(false)).unwrap();
-        let embeddings = prepare_embeddings(
-            &client,
-            &EmbeddingsData::new(vec!["hello".into()], false),
-        )
-        .unwrap();
+        let embeddings =
+            prepare_embeddings(&client, &EmbeddingsData::new(vec!["hello".into()], false)).unwrap();
 
         assert_eq!(chat.url, "https://api.openai.com/v1/chat/completions");
-        assert_eq!(
-            embeddings.url,
-            "https://api.openai.com/v1/embeddings"
-        );
+        assert_eq!(embeddings.url, "https://api.openai.com/v1/embeddings");
     }
 
     #[test]
@@ -572,31 +558,31 @@ mod tests {
 
     #[test]
     fn tool_call_keeps_arguments_when_continuations_omit_id() -> Result<()> {
-        let (mut handler, _rx) = test_handler();
-        let mut state = OpenAiStreamState::default();
+        let mut events = Vec::new();
+        let mut state = OpenAiToolCallAccumulator::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_long_identifier","function":{"name":"web_search","arguments":""}}]}}]}),
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":\""}}]}}]}),
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Rust\"}"}}]}}]}),
         )?;
         assert!(handle_openai_stream_message(
             &mut state,
-            &mut handler,
+            &mut events,
             "[DONE]"
         )?);
 
-        let (_, calls) = handler.take();
+        let calls = tool_calls(&events);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "web_search");
         assert_eq!(calls[0].id.as_deref(), Some("call_long_identifier"));
@@ -616,15 +602,14 @@ mod tests {
         let builder = sse_fixture_builder(&format!("data: {tool_delta}\n\n")).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = openai_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("openai", "test-model"),
-        )
-        .await
-        .expect_err("EOF without [DONE] must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("openai", "test-model"))
+            .await
+            .expect_err("EOF without [DONE] must fail");
 
-        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert_eq!(
+            err.to_string(),
+            "SSE stream ended before protocol completion"
+        );
         assert!(handler.tool_calls().is_empty());
         assert!(matches!(
             rx.try_recv(),
@@ -645,18 +630,11 @@ mod tests {
                 "function":{"name":"side_effect","arguments":"{}"}
             }]}}]
         });
-        let builder = sse_fixture_builder(&format!(
-            "data: {tool_delta}\n\ndata: [DONE]\n\n"
-        ))
-        .await?;
+        let builder =
+            sse_fixture_builder(&format!("data: {tool_delta}\n\ndata: [DONE]\n\n")).await?;
         let (mut handler, _rx) = test_handler();
 
-        openai_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("openai", "test-model"),
-        )
-        .await?;
+        stream_into_handler(builder, &mut handler, &Model::new("openai", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert!(text.is_empty());
@@ -668,21 +646,24 @@ mod tests {
 
     #[test]
     fn tool_call_boundaries_support_shorter_ids_and_reused_or_incrementing_indexes() -> Result<()> {
-        let (mut handler, _rx) = test_handler();
-        let mut state = OpenAiStreamState::default();
+        let mut events = Vec::new();
+        let mut state = OpenAiToolCallAccumulator::default();
 
         for value in [
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_long_identifier","function":{"name":"first","arguments":"{\"value\":1}"}}]}}]}),
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","function":{"name":"second","arguments":"{\"value\":2}"}}]}}]}),
             json!({"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_three","function":{"name":"third","arguments":"{\"value\":3}"}}]}}]}),
         ] {
-            handle_value(&mut state, &mut handler, value)?;
+            handle_value(&mut state, &mut events, value)?;
         }
-        handle_openai_stream_message(&mut state, &mut handler, "[DONE]")?;
+        handle_openai_stream_message(&mut state, &mut events, "[DONE]")?;
 
-        let (_, calls) = handler.take();
+        let calls = tool_calls(&events);
         assert_eq!(
-            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
             ["first", "second", "third"]
         );
         assert_eq!(
@@ -698,12 +679,12 @@ mod tests {
 
     #[test]
     fn tool_call_accumulator_handles_multiple_calls_per_delta() -> Result<()> {
-        let (mut handler, _rx) = test_handler();
-        let mut state = OpenAiStreamState::default();
+        let mut events = Vec::new();
+        let mut state = OpenAiToolCallAccumulator::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"a\":"}},
                 {"index":1,"id":"call_b","function":{"name":"beta","arguments":"{\"b\":"}}
@@ -711,15 +692,15 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"function":{"arguments":"1}"}},
                 {"index":1,"function":{"arguments":"2}"}}
             ]}}]}),
         )?;
-        handle_openai_stream_message(&mut state, &mut handler, "[DONE]")?;
+        handle_openai_stream_message(&mut state, &mut events, "[DONE]")?;
 
-        let (_, calls) = handler.take();
+        let calls = tool_calls(&events);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments, json!({"a":1}));
         assert_eq!(calls[1].arguments, json!({"b":2}));
@@ -728,41 +709,62 @@ mod tests {
 
     #[test]
     fn invalid_tool_arguments_fail_without_dispatching_empty_object() -> Result<()> {
-        let (mut handler, _rx) = test_handler();
-        let mut state = OpenAiStreamState::default();
+        let mut events = Vec::new();
+        let mut state = OpenAiToolCallAccumulator::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"broken","arguments":"{\"value\":"}}]}}]}),
         )?;
-        let err = handle_openai_stream_message(&mut state, &mut handler, "[DONE]")
+        let err = handle_openai_stream_message(&mut state, &mut events, "[DONE]")
             .expect_err("incomplete JSON must fail");
 
         assert!(err
             .to_string()
             .contains("Tool call 'broken' has non-JSON arguments"));
-        let (_, calls) = handler.take();
-        assert!(calls.is_empty());
+        assert!(tool_calls(&events).is_empty());
         Ok(())
     }
 
     #[test]
-    fn successful_text_and_reasoning_stream_is_unchanged() -> Result<()> {
-        let (mut handler, _rx) = test_handler();
-        let mut state = OpenAiStreamState::default();
+    fn text_and_reasoning_deltas_become_typed_events() -> Result<()> {
+        let mut events = Vec::new();
+        let mut state = OpenAiToolCallAccumulator::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"reasoning_content":"reason"}}]}),
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"choices":[{"delta":{"content":"answer"}}]}),
         )?;
-        handle_openai_stream_message(&mut state, &mut handler, "[DONE]")?;
+        handle_openai_stream_message(&mut state, &mut events, "[DONE]")?;
+
+        assert_eq!(
+            events,
+            [
+                ChatEvent::Reasoning("reason".into()),
+                ChatEvent::Text("answer".into()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_reaches_handler_wrapped_in_think_tags() -> Result<()> {
+        let reasoning_delta = json!({"choices":[{"delta":{"reasoning_content":"reason"}}]});
+        let content_delta = json!({"choices":[{"delta":{"content":"answer"}}]});
+        let builder = sse_fixture_builder(&format!(
+            "data: {reasoning_delta}\n\ndata: {content_delta}\n\ndata: [DONE]\n\n"
+        ))
+        .await?;
+        let (mut handler, _rx) = test_handler();
+
+        stream_into_handler(builder, &mut handler, &Model::new("openai", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert_eq!(text, "<think>\nreason\n</think>\n\nanswer");

@@ -376,9 +376,10 @@ impl Server {
                             }
                         };
                     } else {
-                        let ret = client
-                            .chat_completions_streaming_inner(http_client, handler, data)
-                            .await;
+                        let ret = match client.chat_events_inner(http_client, data).await {
+                            Ok(stream) => drive_chat_events(stream, handler).await,
+                            Err(err) => Err(err),
+                        };
                         let first = match ret {
                             Ok(()) => None,
                             Err(err) => Some(format!("{err:?}")),

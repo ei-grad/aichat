@@ -1,12 +1,81 @@
-use super::{catch_error, ToolCall};
+use super::{catch_error, classify_provider_error, ProviderError, ProviderErrorKind, ToolCall};
 use crate::utils::AbortSignal;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
+use async_stream::try_stream;
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde_json::Value;
+use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// A single typed unit of provider streaming output. Providers translate
+/// their wire format into these events; presentation concerns (think-tag
+/// wrapping, rendering) are applied once at the consumption boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatEvent {
+    Text(String),
+    Reasoning(String),
+    ToolCall(ToolCall),
+}
+
+pub type ChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>;
+
+/// Drain a provider event stream into the render handler, wrapping reasoning
+/// deltas in `<think>` tags. Closes an open think tag when the stream ends,
+/// so a reasoning-only or interrupted stream never leaves the tag unpaired.
+pub async fn drive_chat_events(stream: ChatEventStream, handler: &mut SseHandler) -> Result<()> {
+    let mut stream = stream;
+    let mut reasoning = false;
+    while let Some(event) = stream.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                if reasoning {
+                    handler.text("\n</think>\n\n")?;
+                }
+                return Err(err);
+            }
+        };
+        match event {
+            ChatEvent::Text(text) => {
+                if reasoning {
+                    handler.text("\n</think>\n\n")?;
+                    reasoning = false;
+                }
+                handler.text(&text)?;
+            }
+            ChatEvent::Reasoning(text) => {
+                if !reasoning {
+                    handler.text("<think>\n")?;
+                    reasoning = true;
+                }
+                handler.text(&text)?;
+            }
+            ChatEvent::ToolCall(call) => {
+                if reasoning {
+                    handler.text("\n</think>\n\n")?;
+                    reasoning = false;
+                }
+                handler.tool_call(call)?;
+            }
+        }
+    }
+    if reasoning {
+        handler.text("\n</think>\n\n")?;
+    }
+    Ok(())
+}
+
+/// Collect a provider event stream into final text and tool calls, applying
+/// the same think-tag presentation as the streaming pump.
+pub async fn collect_chat_events(stream: ChatEventStream) -> Result<(String, Vec<ToolCall>)> {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = SseHandler::new(tx, crate::utils::create_abort_signal());
+    drive_chat_events(stream, &mut handler).await?;
+    Ok(handler.take())
+}
 
 pub struct SseHandler {
     sender: UnboundedSender<SseEvent>,
@@ -84,99 +153,124 @@ pub enum SseEvent {
 }
 
 #[derive(Debug)]
-pub struct SseMmessage {
+pub struct SseMessage {
     #[allow(unused)]
     pub event: String,
     pub data: String,
 }
 
-pub async fn sse_stream<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
+/// Convert an SSE transport failure into the error to surface, delegating
+/// API-level error bodies to the provider's error parser.
+async fn sse_transport_failure<E>(
+    err: EventSourceError,
+    handle_error: &E,
+    sanitize_transport_errors: bool,
+) -> anyhow::Error
 where
-    F: FnMut(SseMmessage) -> Result<bool>,
+    E: Fn(&Value, u16) -> Result<()>,
 {
-    sse_stream_inner(builder, &mut handle, catch_error, false).await
+    match err {
+        EventSourceError::StreamEnded => anyhow!("SSE stream ended before protocol completion"),
+        EventSourceError::InvalidStatusCode(status, res) => {
+            let status = status.as_u16();
+            let text = match res.text().await {
+                Ok(text) => text,
+                Err(err) => return err.into(),
+            };
+            let data: Value = match text.parse() {
+                Ok(data) => data,
+                Err(_) => {
+                    let message = if sanitize_transport_errors {
+                        format!("Streaming request failed (status: {status})")
+                    } else {
+                        format!("Invalid response data: {text} (status: {status})")
+                    };
+                    return ProviderError::new(
+                        classify_provider_error(status, None),
+                        message,
+                        Some(status),
+                    )
+                    .into();
+                }
+            };
+            match handle_error(&data, status) {
+                Ok(()) => anyhow!("Streaming request failed (status: {status})"),
+                Err(err) => err,
+            }
+        }
+        EventSourceError::InvalidContentType(header_value, res) => {
+            let status = res.status().as_u16();
+            let content_type = header_value.to_str().unwrap_or_default();
+            let message = if sanitize_transport_errors {
+                format!(
+                    "Invalid response event-stream (status: {status}, content-type: {content_type})"
+                )
+            } else {
+                match res.text().await {
+                    Ok(text) => format!(
+                        "Invalid response event-stream. content-type: {content_type}, data: {text}"
+                    ),
+                    Err(err) => return err.into(),
+                }
+            };
+            ProviderError::new(ProviderErrorKind::InvalidResponse, message, Some(status)).into()
+        }
+        _ => anyhow!("{err}"),
+    }
 }
 
-pub(crate) async fn sse_stream_sanitized<F, E>(
+/// SSE-backed provider event stream. `handle` translates one SSE message
+/// into zero or more [`ChatEvent`]s pushed to the scratch buffer and returns
+/// `true` once the wire protocol signals completion; ending without that
+/// signal is reported as a truncated stream.
+pub(crate) fn sse_chat_event_stream<F, E>(
     builder: RequestBuilder,
     mut handle: F,
     handle_error: E,
-) -> Result<()>
-where
-    F: FnMut(SseMmessage) -> Result<bool>,
-    E: Fn(&Value, u16) -> Result<()>,
-{
-    sse_stream_inner(builder, &mut handle, handle_error, true).await
-}
-
-async fn sse_stream_inner<F, E>(
-    builder: RequestBuilder,
-    handle: &mut F,
-    handle_error: E,
     sanitize_transport_errors: bool,
-) -> Result<()>
+) -> ChatEventStream
 where
-    F: FnMut(SseMmessage) -> Result<bool>,
-    E: Fn(&Value, u16) -> Result<()>,
+    F: FnMut(SseMessage, &mut Vec<ChatEvent>) -> Result<bool> + Send + 'static,
+    E: Fn(&Value, u16) -> Result<()> + Send + Sync + 'static,
 {
-    let mut es = builder.eventsource()?;
-    while let Some(event) = es.next().await {
-        match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
-                let message = SseMmessage {
-                    event: message.event,
-                    data: message.data,
-                };
-                if handle(message)? {
-                    es.close();
-                    return Ok(());
-                }
-            }
-            Err(err) => {
-                match err {
-                    EventSourceError::StreamEnded => {
-                        bail!("SSE stream ended before protocol completion");
+    Box::pin(try_stream! {
+        let mut es = builder.eventsource()?;
+        let mut events: Vec<ChatEvent> = Vec::new();
+        let mut done = false;
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(Event::Open) => {}
+                Ok(Event::Message(message)) => {
+                    let message = SseMessage {
+                        event: message.event,
+                        data: message.data,
+                    };
+                    done = handle(message, &mut events)?;
+                    for event in events.drain(..) {
+                        yield event;
                     }
-                    EventSourceError::InvalidStatusCode(status, res) => {
-                        let text = res.text().await?;
-                        let data: Value = match text.parse() {
-                            Ok(data) => data,
-                            Err(_) if sanitize_transport_errors => {
-                                bail!("Streaming request failed (status: {})", status.as_u16());
-                            }
-                            Err(_) => {
-                                bail!(
-                                    "Invalid response data: {text} (status: {})",
-                                    status.as_u16()
-                                );
-                            }
-                        };
-                        handle_error(&data, status.as_u16())?;
-                    }
-                    EventSourceError::InvalidContentType(header_value, res) => {
-                        let status = res.status().as_u16();
-                        let content_type = header_value.to_str().unwrap_or_default();
-                        if sanitize_transport_errors {
-                            bail!(
-                                "Invalid response event-stream (status: {status}, content-type: {content_type})"
-                            );
-                        }
-                        let text = res.text().await?;
-                        bail!(
-                            "Invalid response event-stream. content-type: {}, data: {text}",
-                            content_type
-                        );
-                    }
-                    _ => {
-                        bail!("{}", err);
+                    if done {
+                        es.close();
+                        break;
                     }
                 }
-                es.close();
+                Err(err) => {
+                    Err(sse_transport_failure(err, &handle_error, sanitize_transport_errors)
+                        .await)?;
+                }
             }
         }
-    }
-    bail!("SSE stream ended before protocol completion")
+        if !done {
+            Err(anyhow!("SSE stream ended before protocol completion"))?;
+        }
+    })
+}
+
+pub(crate) fn sse_chat_events<F>(builder: RequestBuilder, handle: F) -> ChatEventStream
+where
+    F: FnMut(SseMessage, &mut Vec<ChatEvent>) -> Result<bool> + Send + 'static,
+{
+    sse_chat_event_stream(builder, handle, catch_error, false)
 }
 
 #[cfg(test)]
@@ -219,34 +313,45 @@ pub(crate) async fn response_fixture_builder(
     Ok(reqwest::Client::new().get(format!("http://{address}")))
 }
 
-pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
+/// JSON-framed provider event stream (bare JSON/NDJSON bodies rather than
+/// SSE). `handle` translates one complete JSON value into zero or more
+/// [`ChatEvent`]s. Unlike SSE there is no in-band completion signal; the
+/// stream ends with the response body.
+pub(crate) fn json_chat_event_stream<S, F, E>(mut stream: S, mut handle: F) -> ChatEventStream
 where
-    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
-    F: FnMut(&str) -> Result<()>,
-    E: std::error::Error,
+    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin + Send + 'static,
+    F: FnMut(&str, &mut Vec<ChatEvent>) -> Result<()> + Send + 'static,
+    E: std::error::Error + Send + 'static,
 {
-    let mut parser = JsonStreamParser::default();
-    let mut unparsed_bytes = vec![];
-    while let Some(chunk_bytes) = stream.next().await {
-        let chunk_bytes =
-            chunk_bytes.map_err(|err| anyhow!("Failed to read json stream, {err}"))?;
-        unparsed_bytes.extend(chunk_bytes);
-        match std::str::from_utf8(&unparsed_bytes) {
-            Ok(text) => {
-                parser.process(text, &mut handle)?;
-                unparsed_bytes.clear();
+    Box::pin(try_stream! {
+        let mut parser = JsonStreamParser::default();
+        let mut events: Vec<ChatEvent> = Vec::new();
+        let mut unparsed_bytes = vec![];
+        while let Some(chunk_bytes) = stream.next().await {
+            let chunk_bytes =
+                chunk_bytes.map_err(|err| anyhow!("Failed to read json stream, {err}"))?;
+            unparsed_bytes.extend(chunk_bytes);
+            match std::str::from_utf8(&unparsed_bytes) {
+                Ok(text) => {
+                    parser.process(text, &mut |value: &str| handle(value, &mut events))?;
+                    unparsed_bytes.clear();
+                }
+                Err(_) => {
+                    continue;
+                }
             }
-            Err(_) => {
-                continue;
+            for event in events.drain(..) {
+                yield event;
             }
         }
-    }
-    if !unparsed_bytes.is_empty() {
-        let text = std::str::from_utf8(&unparsed_bytes)?;
-        parser.process(text, &mut handle)?;
-    }
-
-    Ok(())
+        if !unparsed_bytes.is_empty() {
+            let text = std::str::from_utf8(&unparsed_bytes)?;
+            parser.process(text, &mut |value: &str| handle(value, &mut events))?;
+            for event in events.drain(..) {
+                yield event;
+            }
+        }
+    })
 }
 
 #[derive(Debug, Default)]
@@ -341,13 +446,17 @@ mod tests {
                 .map(|chunk| Ok::<_, std::convert::Infallible>(Bytes::from(chunk)))
                 .collect();
             let stream = stream::iter(chunks);
-            let mut output = vec![];
-            let ret = json_stream(stream, |data| {
-                output.push(data.to_string());
+            let mut events = json_chat_event_stream(stream, |data, events| {
+                events.push(ChatEvent::Text(data.to_string()));
                 Ok(())
-            })
-            .await;
-            assert!(ret.is_ok());
+            });
+            let mut output = vec![];
+            while let Some(event) = events.next().await {
+                match event.expect("json event stream must not fail") {
+                    ChatEvent::Text(text) => output.push(text),
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
             assert_eq!($output.replace("\r\n", "\n"), output.join("\n"))
         };
     }
@@ -370,5 +479,101 @@ mod tests {
 {"key": "value2"}
 {"key": "value3"}"#;
         assert_json_stream!(input, output);
+    }
+
+    fn event_stream(events: Vec<Result<ChatEvent>>) -> ChatEventStream {
+        Box::pin(stream::iter(events))
+    }
+
+    fn pump_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (SseHandler::new(tx, crate::utils::create_abort_signal()), rx)
+    }
+
+    #[tokio::test]
+    async fn pump_wraps_reasoning_in_think_tags() -> Result<()> {
+        let (mut handler, _rx) = pump_handler();
+        drive_chat_events(
+            event_stream(vec![
+                Ok(ChatEvent::Reasoning("thought".into())),
+                Ok(ChatEvent::Text("answer".into())),
+            ]),
+            &mut handler,
+        )
+        .await?;
+        let (text, calls) = handler.take();
+        assert_eq!(text, "<think>\nthought\n</think>\n\nanswer");
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pump_closes_think_tag_when_stream_ends_during_reasoning() -> Result<()> {
+        let (mut handler, _rx) = pump_handler();
+        drive_chat_events(
+            event_stream(vec![Ok(ChatEvent::Reasoning("only thought".into()))]),
+            &mut handler,
+        )
+        .await?;
+        let (text, _) = handler.take();
+        assert_eq!(text, "<think>\nonly thought\n</think>\n\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pump_closes_think_tag_before_tool_call() -> Result<()> {
+        let (mut handler, _rx) = pump_handler();
+        drive_chat_events(
+            event_stream(vec![
+                Ok(ChatEvent::Reasoning("planning".into())),
+                Ok(ChatEvent::ToolCall(ToolCall::new(
+                    "search".into(),
+                    serde_json::json!({}),
+                    Some("call_1".into()),
+                ))),
+            ]),
+            &mut handler,
+        )
+        .await?;
+        let (text, calls) = handler.take();
+        assert_eq!(text, "<think>\nplanning\n</think>\n\n");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pump_closes_think_tag_before_propagating_stream_error() {
+        let (mut handler, _rx) = pump_handler();
+        let err = drive_chat_events(
+            event_stream(vec![
+                Ok(ChatEvent::Reasoning("thinking".into())),
+                Err(anyhow!("stream broke")),
+            ]),
+            &mut handler,
+        )
+        .await
+        .expect_err("stream error must propagate");
+        assert_eq!(err.to_string(), "stream broke");
+        let (text, _) = handler.take();
+        assert_eq!(text, "<think>\nthinking\n</think>\n\n");
+    }
+
+    #[tokio::test]
+    async fn pump_propagates_stream_errors_after_partial_text() {
+        let (mut handler, _rx) = pump_handler();
+        let err = drive_chat_events(
+            event_stream(vec![
+                Ok(ChatEvent::Text("partial".into())),
+                Err(anyhow!("stream broke")),
+            ]),
+            &mut handler,
+        )
+        .await
+        .expect_err("stream error must propagate");
+        assert_eq!(err.to_string(), "stream broke");
+        let (text, calls) = handler.take();
+        assert_eq!(text, "partial");
+        assert!(calls.is_empty());
     }
 }

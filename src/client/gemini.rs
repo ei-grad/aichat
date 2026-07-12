@@ -31,7 +31,7 @@ impl_client_trait!(
     (
         prepare_chat_completions,
         gemini_chat_completions,
-        gemini_chat_completions_streaming
+        gemini_chat_events
     ),
     (prepare_embeddings, embeddings),
     (noop_prepare_rerank, noop_rerank),
@@ -172,10 +172,7 @@ mod tests {
 
         for result in [
             prepare_chat_completions(&client, completion_data()),
-            prepare_embeddings(
-                &client,
-                &EmbeddingsData::new(vec!["hello".into()], false),
-            ),
+            prepare_embeddings(&client, &EmbeddingsData::new(vec!["hello".into()], false)),
         ] {
             let err = result
                 .err()
@@ -192,11 +189,8 @@ mod tests {
     fn absent_api_base_keeps_public_gemini_fallbacks() {
         let client = request_client(None);
         let chat = prepare_chat_completions(&client, completion_data()).unwrap();
-        let embeddings = prepare_embeddings(
-            &client,
-            &EmbeddingsData::new(vec!["hello".into()], false),
-        )
-        .unwrap();
+        let embeddings =
+            prepare_embeddings(&client, &EmbeddingsData::new(vec!["hello".into()], false)).unwrap();
 
         assert_eq!(
             chat.url,

@@ -164,7 +164,8 @@ impl Rag {
                 value
             }
             None => {
-                let models = list_models(&config.read(), ModelType::Embedding);
+                let config = config.read();
+                let models = list_models(&config, ModelType::Embedding);
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }

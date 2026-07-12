@@ -31,8 +31,8 @@ impl_client_trait!(
     CohereClient,
     (
         prepare_chat_completions,
-        chat_completions,
-        chat_completions_streaming
+        cohere_chat_completions,
+        cohere_chat_events
     ),
     (prepare_embeddings, embeddings),
     (prepare_rerank, generic_rerank),
@@ -47,12 +47,7 @@ fn prepare_chat_completions(
         optional_config_field(self_.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
 
     let url = format!("{}/chat", api_base.trim_end_matches('/'));
-    let mut body = openai_build_chat_completions_body(data, &self_.model);
-    if let Some(obj) = body.as_object_mut() {
-        if let Some(top_p) = obj.remove("top_p") {
-            obj.insert("p".to_string(), top_p);
-        }
-    }
+    let body = cohere_build_chat_completions_body(data, &self_.model);
 
     let mut request_data = RequestData::new(url, body);
 
@@ -102,7 +97,17 @@ fn prepare_rerank(self_: &CohereClient, data: &RerankData) -> Result<RequestData
     Ok(request_data)
 }
 
-async fn chat_completions(
+pub fn cohere_build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Value {
+    let mut body = openai_build_chat_completions_body(data, model);
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(top_p) = obj.remove("top_p") {
+            obj.insert("p".to_string(), top_p);
+        }
+    }
+    body
+}
+
+pub async fn cohere_chat_completions(
     builder: RequestBuilder,
     _model: &Model,
 ) -> Result<ChatCompletionsOutput> {
@@ -139,7 +144,7 @@ impl CohereStreamState {
         Ok(())
     }
 
-    fn finish_message(&mut self, handler: &mut SseHandler, terminal: &str) -> Result<()> {
+    fn finish_message(&mut self, events: &mut Vec<ChatEvent>, terminal: &str) -> Result<()> {
         if let Some(tool_call) = self.tool_call.as_ref() {
             bail!(
                 "Cohere {terminal} arrived before tool-call-end for index {}",
@@ -147,7 +152,7 @@ impl CohereStreamState {
             );
         }
         for tool_call in std::mem::take(&mut self.completed_tool_calls) {
-            handler.tool_call(tool_call)?;
+            events.push(ChatEvent::ToolCall(tool_call));
         }
         Ok(())
     }
@@ -175,11 +180,11 @@ impl PendingCohereToolCall {
 
 fn handle_cohere_stream_message(
     state: &mut CohereStreamState,
-    handler: &mut SseHandler,
+    events: &mut Vec<ChatEvent>,
     message: &str,
 ) -> Result<bool> {
     if message == "[DONE]" {
-        state.finish_message(handler, "[DONE]")?;
+        state.finish_message(events, "[DONE]")?;
         return Ok(true);
     }
 
@@ -192,12 +197,12 @@ fn handle_cohere_stream_message(
     match typ {
         "content-delta" => {
             if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
-                handler.text(text)?;
+                events.push(ChatEvent::Text(text.to_string()));
             }
         }
         "tool-plan-delta" => {
             if let Some(text) = data["delta"]["message"]["tool_plan"].as_str() {
-                handler.text(text)?;
+                events.push(ChatEvent::Text(text.to_string()));
             }
         }
         "tool-call-start" => {
@@ -261,7 +266,7 @@ fn handle_cohere_stream_message(
                     "Cohere message-end used finish_reason {finish_reason} for completed tool calls"
                 );
             }
-            state.finish_message(handler, "message-end")?;
+            state.finish_message(events, "message-end")?;
             return Ok(true);
         }
         _ => {}
@@ -269,16 +274,23 @@ fn handle_cohere_stream_message(
     Ok(false)
 }
 
-async fn chat_completions_streaming(
+pub async fn cohere_chat_events(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatEventStream> {
+    let mut state = CohereStreamState::default();
+    Ok(sse_chat_events(builder, move |message, events| {
+        handle_cohere_stream_message(&mut state, events, &message.data)
+    }))
+}
+
+#[cfg(test)]
+async fn stream_into_handler(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    _model: &Model,
+    model: &Model,
 ) -> Result<()> {
-    let mut state = CohereStreamState::default();
-    sse_stream(builder, |message: SseMmessage| {
-        handle_cohere_stream_message(&mut state, handler, &message.data)
-    })
-    .await
+    drive_chat_events(cohere_chat_events(builder, model).await?, handler).await
 }
 
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
@@ -425,10 +437,7 @@ mod tests {
     fn preparation_results(client: &CohereClient) -> [Result<RequestData>; 3] {
         [
             prepare_chat_completions(client, completion_data()),
-            prepare_embeddings(
-                client,
-                &EmbeddingsData::new(vec!["hello".into()], false),
-            ),
+            prepare_embeddings(client, &EmbeddingsData::new(vec!["hello".into()], false)),
             prepare_rerank(
                 client,
                 &RerankData::new("query".into(), vec!["document".into()], 1),
@@ -462,6 +471,51 @@ mod tests {
         assert_eq!(rerank.unwrap().url, "https://api.cohere.ai/v2/rerank");
     }
 
+    #[test]
+    fn content_and_tool_plan_deltas_become_text_events() -> Result<()> {
+        let mut events = Vec::new();
+        let mut state = CohereStreamState::default();
+
+        handle_cohere_stream_message(
+            &mut state,
+            &mut events,
+            &json!({
+                "type":"tool-plan-delta",
+                "delta":{"message":{"tool_plan":"plan "}}
+            })
+            .to_string(),
+        )?;
+        handle_cohere_stream_message(
+            &mut state,
+            &mut events,
+            &json!({
+                "type":"content-delta",
+                "index":0,
+                "delta":{"message":{"content":{"text":"hello"}}}
+            })
+            .to_string(),
+        )?;
+        let done = handle_cohere_stream_message(
+            &mut state,
+            &mut events,
+            &json!({
+                "type":"message-end",
+                "delta":{"finish_reason":"COMPLETE"}
+            })
+            .to_string(),
+        )?;
+
+        assert!(done);
+        assert_eq!(
+            events,
+            [
+                ChatEvent::Text("plan ".into()),
+                ChatEvent::Text("hello".into()),
+            ]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn official_content_stream_completes_on_message_end() -> Result<()> {
         let body = official_sse_body(&[
@@ -492,8 +546,7 @@ mod tests {
         let builder = sse_fixture_builder(&body).await?;
         let (mut handler, _rx) = test_handler();
 
-        chat_completions_streaming(builder, &mut handler, &Model::new("cohere", "test-model"))
-            .await?;
+        stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert_eq!(text, "hello");
@@ -514,8 +567,7 @@ mod tests {
         let builder = sse_fixture_builder(&official_sse_body(&events)).await?;
         let (mut handler, _rx) = test_handler();
 
-        chat_completions_streaming(builder, &mut handler, &Model::new("cohere", "test-model"))
-            .await?;
+        stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert!(text.is_empty());
@@ -530,15 +582,14 @@ mod tests {
         let builder = sse_fixture_builder(&official_sse_body(&tool_call_events())).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("cohere", "test-model"),
-        )
-        .await
-        .expect_err("EOF before message-end must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model"))
+            .await
+            .expect_err("EOF before message-end must fail");
 
-        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert_eq!(
+            err.to_string(),
+            "SSE stream ended before protocol completion"
+        );
         assert!(handler.tool_calls().is_empty());
         assert!(matches!(
             rx.try_recv(),
@@ -560,13 +611,9 @@ mod tests {
         let builder = sse_fixture_builder(&official_sse_body(&events)).await?;
         let (mut handler, _rx) = test_handler();
 
-        let err = chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("cohere", "test-model"),
-        )
-        .await
-        .expect_err("message-end before tool-call-end must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model"))
+            .await
+            .expect_err("message-end before tool-call-end must fail");
 
         assert_eq!(
             err.to_string(),
@@ -581,8 +628,7 @@ mod tests {
         let builder = sse_fixture_builder("data: [DONE]\n\n").await?;
         let (mut handler, _rx) = test_handler();
 
-        chat_completions_streaming(builder, &mut handler, &Model::new("cohere", "test-model"))
-            .await?;
+        stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert!(text.is_empty());

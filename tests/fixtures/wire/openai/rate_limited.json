@@ -1,0 +1,14 @@
+{
+  "transport": "sse",
+  "status": "429 Too Many Requests",
+  "content_type": "application/json",
+  "body_lines": [
+    "{\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"Too many requests\"}}"
+  ],
+  "expect": {
+    "error": {
+      "message": "Too many requests (type: rate_limit_exceeded)",
+      "transient": true
+    }
+  }
+}

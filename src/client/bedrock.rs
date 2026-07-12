@@ -2,7 +2,7 @@ use super::*;
 
 use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256, strip_think_tag};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use aws_smithy_eventstream::frame::{DecodedFrame, MessageFrameDecoder};
 use aws_smithy_eventstream::smithy::parse_response_headers;
 use bytes::BytesMut;
@@ -155,14 +155,13 @@ impl Client for BedrockClient {
         chat_completions(builder).await
     }
 
-    async fn chat_completions_streaming_inner(
+    async fn chat_events_inner(
         &self,
         client: &ReqwestClient,
-        handler: &mut SseHandler,
         data: ChatCompletionsData,
-    ) -> Result<()> {
+    ) -> Result<ChatEventStream> {
         let builder = self.chat_completions_builder(client, data)?;
-        chat_completions_streaming(builder, handler).await
+        bedrock_chat_events(builder).await
     }
 
     async fn embeddings_inner(
@@ -188,10 +187,7 @@ async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutp
     extract_chat_completions(&data)
 }
 
-async fn chat_completions_streaming(
-    builder: RequestBuilder,
-    handler: &mut SseHandler,
-) -> Result<()> {
+pub async fn bedrock_chat_events(builder: RequestBuilder) -> Result<ChatEventStream> {
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
@@ -200,102 +196,92 @@ async fn chat_completions_streaming(
         bail!("Invalid response data: {data}");
     }
 
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
-
     let mut stream = res.bytes_stream();
-    let mut buffer = BytesMut::new();
-    let mut decoder = MessageFrameDecoder::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.extend_from_slice(&chunk);
-        while let DecodedFrame::Complete(message) = decoder.decode_frame(&mut buffer)? {
-            let response_headers = parse_response_headers(&message)?;
-            let message_type = response_headers.message_type.as_str();
-            let smithy_type = response_headers.smithy_type.as_str();
-            match (message_type, smithy_type) {
-                ("event", _) => {
-                    let data: Value = serde_json::from_slice(message.payload())?;
-                    debug!("stream-data: {smithy_type} {data}");
-                    match smithy_type {
-                        "contentBlockStart" => {
-                            if let Some(tool_use) = data["start"]["toolUse"].as_object() {
-                                if let (Some(id), Some(name)) = (
-                                    json_str_from_map(tool_use, "toolUseId"),
-                                    json_str_from_map(tool_use, "name"),
-                                ) {
-                                    if !function_name.is_empty() {
-                                        if function_arguments.is_empty() {
-                                            function_arguments = String::from("{}");
+    Ok(Box::pin(async_stream::try_stream! {
+        let mut function_name = String::new();
+        let mut function_arguments = String::new();
+        let mut function_id = String::new();
+
+        let mut buffer = BytesMut::new();
+        let mut decoder = MessageFrameDecoder::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.extend_from_slice(&chunk);
+            while let DecodedFrame::Complete(message) = decoder.decode_frame(&mut buffer)? {
+                let response_headers = parse_response_headers(&message)?;
+                let message_type = response_headers.message_type.as_str();
+                let smithy_type = response_headers.smithy_type.as_str();
+                match (message_type, smithy_type) {
+                    ("event", _) => {
+                        let data: Value = serde_json::from_slice(message.payload())?;
+                        debug!("stream-data: {smithy_type} {data}");
+                        match smithy_type {
+                            "contentBlockStart" => {
+                                if let Some(tool_use) = data["start"]["toolUse"].as_object() {
+                                    if let (Some(id), Some(name)) = (
+                                        json_str_from_map(tool_use, "toolUseId"),
+                                        json_str_from_map(tool_use, "name"),
+                                    ) {
+                                        if !function_name.is_empty() {
+                                            if function_arguments.is_empty() {
+                                                function_arguments = String::from("{}");
+                                            }
+                                            let arguments: Value =
+                                            function_arguments.parse().with_context(|| {
+                                                format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+                                            })?;
+                                            yield ChatEvent::ToolCall(ToolCall::new(
+                                                function_name.clone(),
+                                                arguments,
+                                                Some(function_id.clone()),
+                                            ));
                                         }
-                                        let arguments: Value =
-                                        function_arguments.parse().with_context(|| {
-                                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                        })?;
-                                        handler.tool_call(ToolCall::new(
-                                            function_name.clone(),
-                                            arguments,
-                                            Some(function_id.clone()),
-                                        ))?;
+                                        function_arguments.clear();
+                                        function_name = name.into();
+                                        function_id = id.into();
                                     }
-                                    function_arguments.clear();
-                                    function_name = name.into();
-                                    function_id = id.into();
                                 }
                             }
-                        }
-                        "contentBlockDelta" => {
-                            if let Some(text) = data["delta"]["text"].as_str() {
-                                handler.text(text)?;
-                            } else if let Some(text) =
-                                data["delta"]["reasoningContent"]["text"].as_str()
-                            {
-                                if reasoning_state == 0 {
-                                    handler.text("<think>\n")?;
-                                    reasoning_state = 1;
+                            "contentBlockDelta" => {
+                                if let Some(text) = data["delta"]["text"].as_str() {
+                                    yield ChatEvent::Text(text.to_string());
+                                } else if let Some(text) =
+                                    data["delta"]["reasoningContent"]["text"].as_str()
+                                {
+                                    yield ChatEvent::Reasoning(text.to_string());
+                                } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
+                                    function_arguments.push_str(input);
                                 }
-                                handler.text(text)?;
-                            } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
-                                function_arguments.push_str(input);
                             }
-                        }
-                        "contentBlockStop" => {
-                            if reasoning_state == 1 {
-                                handler.text("\n</think>\n\n")?;
-                                reasoning_state = 0;
-                            }
-                            if !function_name.is_empty() {
+                            "contentBlockStop" if !function_name.is_empty() => {
                                 if function_arguments.is_empty() {
                                     function_arguments = String::from("{}");
                                 }
                                 let arguments: Value = function_arguments.parse().with_context(|| {
                                     format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
                                 })?;
-                                handler.tool_call(ToolCall::new(
+                                yield ChatEvent::ToolCall(ToolCall::new(
                                     function_name.clone(),
                                     arguments,
                                     Some(function_id.clone()),
-                                ))?;
+                                ));
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                ("exception", _) => {
-                    let payload = base64_decode(message.payload())?;
-                    let data = String::from_utf8_lossy(&payload);
+                    ("exception", _) => {
+                        let payload = base64_decode(message.payload())?;
+                        let data = String::from_utf8_lossy(&payload);
 
-                    bail!("Invalid response data: {data} (smithy_type: {smithy_type})")
-                }
-                _ => {
-                    bail!("Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}",);
+                        Err(anyhow!("Invalid response data: {data} (smithy_type: {smithy_type})"))?;
+                    }
+                    _ => {
+                        Err(anyhow!("Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}"))?;
+                    }
                 }
             }
         }
-    }
-    Ok(())
+    }))
 }
 
 async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
@@ -328,7 +314,9 @@ fn canonical_model_path_segment(model_name: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
                 decoded.push((high << 4) | low);
                 index += 3;
                 continue;
@@ -690,10 +678,8 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
 mod tests {
     use super::*;
 
-    const MISSING_SESSION_TOKEN_ENV: &str =
-        "AICHAT_TEST_MISSING_BEDROCK_SESSION_TOKEN_61C5210F";
-    const CONVENTIONAL_SESSION_TOKEN_ENV: &str =
-        "BEDROCK_REMEDIATION_TEST_SESSION_TOKEN";
+    const MISSING_SESSION_TOKEN_ENV: &str = "AICHAT_TEST_MISSING_BEDROCK_SESSION_TOKEN_61C5210F";
+    const CONVENTIONAL_SESSION_TOKEN_ENV: &str = "BEDROCK_REMEDIATION_TEST_SESSION_TOKEN";
 
     fn request_client(session_token: Option<String>) -> BedrockClient {
         BedrockClient {
@@ -733,10 +719,7 @@ mod tests {
 
         for result in [
             client.chat_completions_builder(&http, completion_data()),
-            client.embeddings_builder(
-                &http,
-                &EmbeddingsData::new(vec!["hello".into()], false),
-            ),
+            client.embeddings_builder(&http, &EmbeddingsData::new(vec!["hello".into()], false)),
         ] {
             let err = result
                 .expect_err("missing explicit reference must fail before request preparation");
@@ -759,18 +742,13 @@ mod tests {
             .build()
             .unwrap();
         let embeddings = client
-            .embeddings_builder(
-                &http,
-                &EmbeddingsData::new(vec!["hello".into()], false),
-            )
+            .embeddings_builder(&http, &EmbeddingsData::new(vec!["hello".into()], false))
             .unwrap()
             .build()
             .unwrap();
 
         assert!(!chat.headers().contains_key("x-amz-security-token"));
-        assert!(!embeddings
-            .headers()
-            .contains_key("x-amz-security-token"));
+        assert!(!embeddings.headers().contains_key("x-amz-security-token"));
     }
 
     #[test]
@@ -802,7 +780,10 @@ mod tests {
             canonical_model_path_segment("model%2Fvariant%GG%"),
             "model%2Fvariant%25GG%25"
         );
-        assert_eq!(canonical_model_path_segment("model%252Fvariant"), "model%252Fvariant");
+        assert_eq!(
+            canonical_model_path_segment("model%252Fvariant"),
+            "model%252Fvariant"
+        );
         assert_eq!(canonical_model_path_segment("模型"), "%E6%A8%A1%E5%9E%8B");
     }
 

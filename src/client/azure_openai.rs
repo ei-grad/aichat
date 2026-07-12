@@ -34,7 +34,7 @@ impl_client_trait!(
     (
         prepare_chat_completions,
         openai_chat_completions,
-        openai_chat_completions_streaming
+        openai_chat_events
     ),
     (prepare_embeddings, openai_embeddings),
     (noop_prepare_rerank, noop_rerank),

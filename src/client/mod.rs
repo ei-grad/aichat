@@ -1,66 +1,33 @@
-mod access_token;
-mod common;
-mod message;
 #[macro_use]
 mod macros;
+
+mod access_token;
+mod azure_openai;
+mod bedrock;
+mod claude;
+mod cohere;
+mod common;
+mod error;
+mod gemini;
+mod message;
 mod model;
+mod openai;
+mod openai_compatible;
+mod registry;
+mod retry;
 mod stream;
+mod vertexai;
+#[cfg(test)]
+mod wire_tests;
 
 pub use crate::function::ToolCall;
 pub use common::*;
+pub use error::*;
 pub use message::*;
 pub use model::*;
+pub use registry::*;
+pub(crate) use retry::*;
 pub use stream::*;
-
-register_client!(
-    (openai, "openai", OpenAIConfig, OpenAIClient),
-    (
-        openai_compatible,
-        "openai-compatible",
-        OpenAICompatibleConfig,
-        OpenAICompatibleClient
-    ),
-    (gemini, "gemini", GeminiConfig, GeminiClient),
-    (claude, "claude", ClaudeConfig, ClaudeClient),
-    (cohere, "cohere", CohereConfig, CohereClient),
-    (
-        azure_openai,
-        "azure-openai",
-        AzureOpenAIConfig,
-        AzureOpenAIClient
-    ),
-    (vertexai, "vertexai", VertexAIConfig, VertexAIClient),
-    (bedrock, "bedrock", BedrockConfig, BedrockClient),
-);
-
-pub const OPENAI_COMPATIBLE_PROVIDERS: [(&str, &str); 19] = [
-    ("ai21", "https://api.ai21.com/studio/v1"),
-    (
-        "cloudflare",
-        "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1",
-    ),
-    ("deepinfra", "https://api.deepinfra.com/v1/openai"),
-    ("deepseek", "https://api.deepseek.com"),
-    ("ernie", "https://qianfan.baidubce.com/v2"),
-    ("github", "https://models.inference.ai.azure.com"),
-    ("groq", "https://api.groq.com/openai/v1"),
-    ("hunyuan", "https://api.hunyuan.cloud.tencent.com/v1"),
-    ("minimax", "https://api.minimax.io/v1"),
-    ("mistral", "https://api.mistral.ai/v1"),
-    ("moonshot", "https://api.moonshot.cn/v1"),
-    ("moonshot_intl", "https://api.moonshot.ai/v1"),
-    ("openrouter", "https://openrouter.ai/api/v1"),
-    ("perplexity", "https://api.perplexity.ai"),
-    (
-        "qianwen",
-        "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    ),
-    ("xai", "https://api.x.ai/v1"),
-    ("zhipuai", "https://open.bigmodel.cn/api/paas/v4"),
-    // RAG-dedicated
-    ("jina", "https://api.jina.ai/v1"),
-    ("voyageai", "https://api.voyageai.com/v1"),
-];
 
 #[cfg(test)]
 mod catalog_tests {
@@ -94,11 +61,19 @@ mod catalog_tests {
 
     #[test]
     fn regional_provider_endpoints_are_explicit() {
-        assert!(OPENAI_COMPATIBLE_PROVIDERS.contains(&("moonshot", "https://api.moonshot.cn/v1")));
-        assert!(
-            OPENAI_COMPATIBLE_PROVIDERS.contains(&("moonshot_intl", "https://api.moonshot.ai/v1"))
+        let catalog = catalog();
+        assert_eq!(
+            provider(&catalog, "moonshot").api_base.as_deref(),
+            Some("https://api.moonshot.cn/v1")
         );
-        assert!(OPENAI_COMPATIBLE_PROVIDERS.contains(&("minimax", "https://api.minimax.io/v1")));
+        assert_eq!(
+            provider(&catalog, "moonshot_intl").api_base.as_deref(),
+            Some("https://api.moonshot.ai/v1")
+        );
+        assert_eq!(
+            provider(&catalog, "minimax").api_base.as_deref(),
+            Some("https://api.minimax.io/v1")
+        );
     }
 
     #[test]

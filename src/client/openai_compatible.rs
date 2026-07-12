@@ -1,4 +1,14 @@
+use super::claude::{
+    claude_build_chat_completions_body, claude_chat_completions, claude_chat_events,
+    CLAUDE_API_VERSION,
+};
+use super::cohere::{
+    cohere_build_chat_completions_body, cohere_chat_completions, cohere_chat_events,
+};
 use super::openai::*;
+use super::vertexai::{
+    gemini_build_chat_completions_body, gemini_chat_completions, gemini_chat_events,
+};
 use super::*;
 
 use anyhow::{Context, Result};
@@ -11,6 +21,9 @@ pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
+    /// Wire protocol the endpoint speaks; defaults to the catalog entry
+    /// matching the client name, then to the OpenAI dialect.
+    pub wire_format: Option<WireFormat>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -21,19 +34,71 @@ impl OpenAICompatibleClient {
     config_get_fn!(api_base, get_api_base);
     config_get_fn!(api_key, get_api_key);
 
-    pub const PROMPTS: [PromptAction<'static>; 0] = [];
+    fn wire_format(&self) -> WireFormat {
+        self.config.wire_format.unwrap_or_else(|| {
+            ALL_PROVIDER_MODELS
+                .iter()
+                .find(|v| self.model.client_name().starts_with(&v.provider))
+                .map(|v| v.wire_format)
+                .unwrap_or_default()
+        })
+    }
 }
 
-impl_client_trait!(
-    OpenAICompatibleClient,
-    (
-        prepare_chat_completions,
-        openai_chat_completions,
-        openai_chat_completions_streaming
-    ),
-    (prepare_embeddings, openai_embeddings),
-    (prepare_rerank, generic_rerank),
-);
+#[async_trait::async_trait]
+impl Client for OpenAICompatibleClient {
+    client_common_fns!();
+
+    async fn chat_completions_inner(
+        &self,
+        client: &reqwest::Client,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        match self.wire_format() {
+            WireFormat::Openai => openai_chat_completions(builder, self.model()).await,
+            WireFormat::Claude => claude_chat_completions(builder, self.model()).await,
+            WireFormat::Gemini => gemini_chat_completions(builder, self.model()).await,
+            WireFormat::Cohere => cohere_chat_completions(builder, self.model()).await,
+        }
+    }
+
+    async fn chat_events_inner(
+        &self,
+        client: &reqwest::Client,
+        data: ChatCompletionsData,
+    ) -> Result<ChatEventStream> {
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        match self.wire_format() {
+            WireFormat::Openai => openai_chat_events(builder, self.model()).await,
+            WireFormat::Claude => claude_chat_events(builder, self.model()).await,
+            WireFormat::Gemini => gemini_chat_events(builder, self.model()).await,
+            WireFormat::Cohere => cohere_chat_events(builder, self.model()).await,
+        }
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &reqwest::Client,
+        data: &EmbeddingsData,
+    ) -> Result<EmbeddingsOutput> {
+        let request_data = prepare_embeddings(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        openai_embeddings(builder, self.model()).await
+    }
+
+    async fn rerank_inner(
+        &self,
+        client: &reqwest::Client,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
+        let request_data = prepare_rerank(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        generic_rerank(builder, self.model()).await
+    }
+}
 
 fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
@@ -41,15 +106,43 @@ fn prepare_chat_completions(
 ) -> Result<RequestData> {
     let api_key = optional_config_field(self_.get_api_key())?;
     let api_base = get_api_base_ext(self_)?;
+    let wire_format = self_.wire_format();
 
-    let url = format!("{api_base}/chat/completions");
-
-    let body = openai_build_chat_completions_body(data, &self_.model);
-
-    let mut request_data = RequestData::new(url, body);
+    let mut request_data = match wire_format {
+        WireFormat::Openai => RequestData::new(
+            format!("{api_base}/chat/completions"),
+            openai_build_chat_completions_body(data, &self_.model),
+        ),
+        WireFormat::Claude => {
+            let mut request_data = RequestData::new(
+                format!("{api_base}/messages"),
+                claude_build_chat_completions_body(data, &self_.model)?,
+            );
+            request_data.header("anthropic-version", CLAUDE_API_VERSION);
+            request_data
+        }
+        WireFormat::Gemini => {
+            let func = match data.stream {
+                true => "streamGenerateContent",
+                false => "generateContent",
+            };
+            RequestData::new(
+                format!("{api_base}/models/{}:{func}", self_.model.real_name()),
+                gemini_build_chat_completions_body(data, &self_.model)?,
+            )
+        }
+        WireFormat::Cohere => RequestData::new(
+            format!("{api_base}/chat"),
+            cohere_build_chat_completions_body(data, &self_.model),
+        ),
+    };
 
     if let Some(api_key) = api_key {
-        request_data.bearer_auth(api_key);
+        match wire_format {
+            WireFormat::Claude => request_data.header("x-api-key", api_key),
+            WireFormat::Gemini => request_data.header("x-goog-api-key", api_key),
+            WireFormat::Openai | WireFormat::Cohere => request_data.bearer_auth(api_key),
+        }
     }
 
     Ok(request_data)
@@ -99,16 +192,9 @@ fn prepare_rerank(self_: &OpenAICompatibleClient, data: &RerankData) -> Result<R
 fn get_api_base_ext(self_: &OpenAICompatibleClient) -> Result<String> {
     let api_base = match optional_config_field(self_.get_api_base())? {
         Some(api_base) => api_base,
-        None => OPENAI_COMPATIBLE_PROVIDERS
-            .into_iter()
-            .find_map(|(name, api_base)| {
-                if name == self_.model.client_name() {
-                    Some(api_base.to_string())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("Miss 'api_base'"))?,
+        None => compat_provider_api_base(self_.model.client_name())
+            .ok_or_else(|| anyhow::anyhow!("Miss 'api_base'"))?
+            .to_string(),
     };
     Ok(api_base.trim_end_matches('/').to_string())
 }
@@ -161,10 +247,8 @@ pub fn generic_build_rerank_body(data: &RerankData, model: &Model) -> Value {
 mod tests {
     use super::*;
 
-    const MISSING_API_KEY_ENV: &str =
-        "AICHAT_TEST_MISSING_OPENAI_COMPATIBLE_API_KEY_B07D8216";
-    const MISSING_API_BASE_ENV: &str =
-        "AICHAT_TEST_MISSING_OPENAI_COMPATIBLE_API_BASE_F5813573";
+    const MISSING_API_KEY_ENV: &str = "AICHAT_TEST_MISSING_OPENAI_COMPATIBLE_API_KEY_B07D8216";
+    const MISSING_API_BASE_ENV: &str = "AICHAT_TEST_MISSING_OPENAI_COMPATIBLE_API_BASE_F5813573";
 
     fn request_client(
         name: &str,
@@ -177,12 +261,23 @@ mod tests {
                 name: Some(name.to_string()),
                 api_base,
                 api_key,
+                wire_format: None,
                 models: vec![],
                 patch: None,
                 extra: None,
             },
             model: Model::new(name, "test-model"),
         }
+    }
+
+    fn wire_client(wire_format: WireFormat) -> OpenAICompatibleClient {
+        let mut client = request_client(
+            "wire-format-test",
+            Some("https://local.invalid/v1".into()),
+            Some("test-key".into()),
+        );
+        client.config.wire_format = Some(wire_format);
+        client
     }
 
     fn completion_data() -> ChatCompletionsData {
@@ -201,10 +296,7 @@ mod tests {
     fn preparation_results(client: &OpenAICompatibleClient) -> [Result<RequestData>; 3] {
         [
             prepare_chat_completions(client, completion_data()),
-            prepare_embeddings(
-                client,
-                &EmbeddingsData::new(vec!["hello".into()], false),
-            ),
+            prepare_embeddings(client, &EmbeddingsData::new(vec!["hello".into()], false)),
             prepare_rerank(
                 client,
                 &RerankData::new("query".into(), vec!["document".into()], 1),
@@ -238,11 +330,7 @@ mod tests {
             Some(format!("${MISSING_API_KEY_ENV}")),
         );
 
-        assert_reference_errors(
-            preparation_results(&client),
-            "api_key",
-            MISSING_API_KEY_ENV,
-        );
+        assert_reference_errors(preparation_results(&client), "api_key", MISSING_API_KEY_ENV);
     }
 
     #[test]
@@ -261,17 +349,71 @@ mod tests {
     #[test]
     fn missing_explicit_api_base_is_not_replaced_by_provider_default() {
         assert!(std::env::var_os(MISSING_API_BASE_ENV).is_none());
-        let client = request_client(
-            "openrouter",
-            Some(format!("${MISSING_API_BASE_ENV}")),
-            None,
-        );
+        let client = request_client("openrouter", Some(format!("${MISSING_API_BASE_ENV}")), None);
 
         assert_reference_errors(
             preparation_results(&client),
             "api_base",
             MISSING_API_BASE_ENV,
         );
+    }
+
+    #[test]
+    fn claude_wire_format_uses_messages_path_and_api_key_header() {
+        let request =
+            prepare_chat_completions(&wire_client(WireFormat::Claude), completion_data()).unwrap();
+        assert_eq!(request.url, "https://local.invalid/v1/messages");
+        assert_eq!(
+            request.headers.get("x-api-key").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            request.headers.get("anthropic-version").map(String::as_str),
+            Some(CLAUDE_API_VERSION)
+        );
+        assert!(!request.headers.contains_key("authorization"));
+        assert!(request.body.get("messages").is_some());
+    }
+
+    #[test]
+    fn gemini_wire_format_uses_model_path_and_goog_header() {
+        let request =
+            prepare_chat_completions(&wire_client(WireFormat::Gemini), completion_data()).unwrap();
+        assert_eq!(
+            request.url,
+            "https://local.invalid/v1/models/test-model:generateContent"
+        );
+        assert_eq!(
+            request.headers.get("x-goog-api-key").map(String::as_str),
+            Some("test-key")
+        );
+        assert!(request.body.get("contents").is_some());
+    }
+
+    #[test]
+    fn cohere_wire_format_uses_chat_path_and_renamed_sampling() {
+        let mut data = completion_data();
+        data.top_p = Some(0.9);
+        let request = prepare_chat_completions(&wire_client(WireFormat::Cohere), data).unwrap();
+        assert_eq!(request.url, "https://local.invalid/v1/chat");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-key")
+        );
+        assert!(request.body.get("top_p").is_none());
+        assert_eq!(request.body["p"], serde_json::json!(0.9));
+    }
+
+    #[test]
+    fn wire_format_defaults_to_openai_for_unknown_providers() {
+        let client = request_client(
+            "wire-format-test",
+            Some("https://local.invalid/v1".into()),
+            None,
+        );
+        assert_eq!(client.wire_format(), WireFormat::Openai);
+        let request = prepare_chat_completions(&client, completion_data()).unwrap();
+        assert_eq!(request.url, "https://local.invalid/v1/chat/completions");
     }
 
     #[test]

@@ -373,6 +373,7 @@
 #  - https://mistral.ai/pricing#api-pricing
 #  - https://docs.mistral.ai/api/
 - provider: mistral
+  api_base: https://api.mistral.ai/v1
   models:
     - name: mistral-large-latest
       max_output_tokens: 262144
@@ -432,6 +433,7 @@
 #  - https://www.ai21.com/pricing
 #  - https://docs.ai21.com/reference/jamba-1-6-api-ref
 - provider: ai21
+  api_base: https://api.ai21.com/studio/v1
   models:
     - name: jamba-large
       max_input_tokens: 256000
@@ -504,6 +506,7 @@
 #  - https://docs.x.ai/docs/models
 #  - https://docs.x.ai/docs/api-reference#chat-completions
 - provider: xai
+  api_base: https://api.x.ai/v1
   models:
     - name: grok-4-1-fast-non-reasoning
       max_input_tokens: 2000000
@@ -525,6 +528,7 @@
 #  - https://docs.perplexity.ai/getting-started/models
 #  - https://docs.perplexity.ai/api-reference/chat-completions
 - provider: perplexity
+  api_base: https://api.perplexity.ai
   models:
     - name: sonar-pro
       max_input_tokens: 200000
@@ -547,6 +551,7 @@
 #  - https://console.groq.com/docs/models
 #  - https://console.groq.com/docs/api-reference#chat
 - provider: groq
+  api_base: https://api.groq.com/openai/v1
   models:
     - name: openai/gpt-oss-120b
       max_input_tokens: 131072
@@ -1090,6 +1095,7 @@
 #  - https://developers.cloudflare.com/workers-ai/models/
 #  - https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
 - provider: cloudflare
+  api_base: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
   models:
     - name: '@cf/meta/llama-4-scout-17b-16e-instruct'
       max_input_tokens: 131072
@@ -1144,6 +1150,7 @@
 #  - https://cloud.baidu.com/doc/qianfan/s/rmh4stp0j
 #  - https://cloud.baidu.com/doc/qianfan/s/wmh4sv6ya
 - provider: ernie
+  api_base: https://qianfan.baidubce.com/v2
   models:
     - name: ernie-4.5-turbo-128k
       max_input_tokens: 131072
@@ -1184,6 +1191,7 @@
 #  - https://help.aliyun.com/zh/model-studio/getting-started/models
 #  - https://help.aliyun.com/zh/model-studio/developer-reference/use-qwen-by-calling-api
 - provider: qianwen
+  api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
   models:
     - name: qwen3.5-plus
       max_input_tokens: 262144
@@ -1286,6 +1294,7 @@
 #  - https://cloud.tencent.com/document/product/1729/97731
 #  - https://cloud.tencent.com/document/product/1729/111007
 - provider: hunyuan
+  api_base: https://api.hunyuan.cloud.tencent.com/v1
   models:
     - name: hunyuan-2.0-instruct-20251111
       max_input_tokens: 131072
@@ -1313,6 +1322,7 @@
 #  - https://platform.kimi.ai/docs/guide/start-using-kimi-api
 #  - https://platform.kimi.ai/docs/models
 - provider: moonshot_intl
+  api_base: https://api.moonshot.ai/v1
   models:
     - name: kimi-k2.7-code
       max_input_tokens: 262144
@@ -1351,6 +1361,7 @@
 #  - https://platform.kimi.com/docs/api/overview
 #  - https://platform.kimi.com/docs/models
 - provider: moonshot
+  api_base: https://api.moonshot.cn/v1
   models:
     - name: kimi-k2.6
       max_input_tokens: 262144
@@ -1375,6 +1386,7 @@
 #  - https://api-docs.deepseek.com/quick_start/pricing
 #  - https://api-docs.deepseek.com/news/news260424/
 - provider: deepseek
+  api_base: https://api.deepseek.com
   models:
     - name: deepseek-chat
       max_input_tokens: 1000000
@@ -1405,6 +1417,7 @@
 #  - https://open.bigmodel.cn/pricing
 #  - https://open.bigmodel.cn/dev/api#glm-4
 - provider: zhipuai
+  api_base: https://open.bigmodel.cn/api/paas/v4
   models:
     - name: glm-5
       max_input_tokens: 202752
@@ -1456,6 +1469,7 @@
 # - https://platform.minimax.io/docs/api-reference/text-openai-api
 # - https://platform.minimax.io/docs/guides/pricing-paygo
 - provider: minimax
+  api_base: https://api.minimax.io/v1
   models:
     - name: MiniMax-M2.7
       max_input_tokens: 204800
@@ -1493,6 +1507,7 @@
 #  - https://openrouter.ai/docs/api-reference/chat-completion
 #  - https://openrouter.ai/docs/cookbook/evaluate-and-optimize/model-migrations/claude-4-7
 - provider: openrouter
+  api_base: https://openrouter.ai/api/v1
   models:
     - name: openai/gpt-5.2
       max_input_tokens: 400000
@@ -1904,6 +1919,7 @@
 # Links:
 #  - https://github.com/marketplace?type=models
 - provider: github
+  api_base: https://models.inference.ai.azure.com
   models:
     - name: gpt-5
       max_input_tokens: 400000
@@ -1989,6 +2005,7 @@
 #  - https://deepinfra.com/models
 #  - https://deepinfra.com/docs/openai_api
 - provider: deepinfra
+  api_base: https://api.deepinfra.com/v1/openai
   models:
     - name: openai/gpt-oss-120b
       max_input_tokens: 131072
@@ -2150,6 +2167,7 @@
 #  - https://jina.ai/models
 #  - https://api.jina.ai/redoc
 - provider: jina
+  api_base: https://api.jina.ai/v1
   models:
     - name: jina-embeddings-v3
       type: embedding
@@ -2183,6 +2201,7 @@
 #  - https://docs.voyageai.com/docs/pricing
 #  - https://docs.voyageai.com/reference/
 - provider: voyageai
+  api_base: https://api.voyageai.com/v1
   models:
     - name: voyage-3-large
       type: embedding

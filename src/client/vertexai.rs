@@ -53,27 +53,20 @@ impl Client for VertexAIClient {
         }
     }
 
-    async fn chat_completions_streaming_inner(
+    async fn chat_events_inner(
         &self,
         client: &ReqwestClient,
-        handler: &mut SseHandler,
         data: ChatCompletionsData,
-    ) -> Result<()> {
+    ) -> Result<ChatEventStream> {
         prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
         let model = self.model();
         let model_category = ModelCategory::from_str(model.real_name())?;
         let request_data = prepare_chat_completions(self, data, &model_category)?;
         let builder = self.request_builder(client, request_data);
         match model_category {
-            ModelCategory::Gemini => {
-                gemini_chat_completions_streaming(builder, handler, model).await
-            }
-            ModelCategory::Claude => {
-                claude_chat_completions_streaming(builder, handler, model).await
-            }
-            ModelCategory::Mistral => {
-                openai_chat_completions_streaming(builder, handler, model).await
-            }
+            ModelCategory::Gemini => gemini_chat_events(builder, model).await,
+            ModelCategory::Claude => claude_chat_events(builder, model).await,
+            ModelCategory::Mistral => openai_chat_events(builder, model).await,
         }
     }
 
@@ -152,20 +145,14 @@ fn prepare_chat_completions(
     Ok(request_data)
 }
 
-fn prediction_base_url(
-    project_id: &str,
-    location: &str,
-    model_category: ModelCategory,
-) -> String {
+fn prediction_base_url(project_id: &str, location: &str, model_category: ModelCategory) -> String {
     let host = match (model_category, location) {
         (_, "global") => "aiplatform.googleapis.com".to_string(),
         (ModelCategory::Claude, "us") => "aiplatform.us.rep.googleapis.com".to_string(),
         (ModelCategory::Claude, "eu") => "aiplatform.eu.rep.googleapis.com".to_string(),
         _ => format!("{location}-aiplatform.googleapis.com"),
     };
-    format!(
-        "https://{host}/v1/projects/{project_id}/locations/{location}/publishers"
-    )
+    format!("https://{host}/v1/projects/{project_id}/locations/{location}/publishers")
 }
 
 fn prepare_embeddings(self_: &VertexAIClient, data: &EmbeddingsData) -> Result<RequestData> {
@@ -210,46 +197,48 @@ pub async fn gemini_chat_completions(
     gemini_extract_chat_completions_text(&data)
 }
 
-pub async fn gemini_chat_completions_streaming(
+pub async fn gemini_chat_events(
     builder: RequestBuilder,
-    handler: &mut SseHandler,
     _model: &Model,
-) -> Result<()> {
+) -> Result<ChatEventStream> {
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
         let data: Value = res.json().await?;
         catch_error(&data, status.as_u16())?;
-    } else {
-        let handle = |value: &str| -> Result<()> {
-            let data: Value = serde_json::from_str(value)?;
-            debug!("stream-data: {data}");
-            if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
-                for (i, part) in parts.iter().enumerate() {
-                    if let Some(text) = part["text"].as_str() {
-                        if i > 0 {
-                            handler.text("\n\n")?;
-                        }
-                        handler.text(text)?;
-                    } else if let (Some(name), Some(args)) = (
-                        part["functionCall"]["name"].as_str(),
-                        part["functionCall"]["args"].as_object(),
-                    ) {
-                        handler.tool_call(ToolCall::new(name.to_string(), json!(args), None))?;
-                    }
-                }
-            } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
-                .as_str()
-                .or_else(|| data["candidates"][0]["finishReason"].as_str())
-            {
-                bail!("Blocked due to safety")
-            }
-
-            Ok(())
-        };
-        json_stream(res.bytes_stream(), handle).await?;
+        return Ok(Box::pin(futures_util::stream::empty::<Result<ChatEvent>>()));
     }
-    Ok(())
+    let handle = |value: &str, events: &mut Vec<ChatEvent>| -> Result<()> {
+        let data: Value = serde_json::from_str(value)?;
+        debug!("stream-data: {data}");
+        if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
+            for (i, part) in parts.iter().enumerate() {
+                if let Some(text) = part["text"].as_str() {
+                    if i > 0 {
+                        events.push(ChatEvent::Text("\n\n".to_string()));
+                    }
+                    events.push(ChatEvent::Text(text.to_string()));
+                } else if let (Some(name), Some(args)) = (
+                    part["functionCall"]["name"].as_str(),
+                    part["functionCall"]["args"].as_object(),
+                ) {
+                    events.push(ChatEvent::ToolCall(ToolCall::new(
+                        name.to_string(),
+                        json!(args),
+                        None,
+                    )));
+                }
+            }
+        } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
+            .as_str()
+            .or_else(|| data["candidates"][0]["finishReason"].as_str())
+        {
+            bail!("Blocked due to safety")
+        }
+
+        Ok(())
+    };
+    Ok(json_chat_event_stream(res.bytes_stream(), handle))
 }
 
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {

@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 const API_BASE: &str = "https://api.anthropic.com/v1";
 
+pub const CLAUDE_API_VERSION: &str = "2023-06-01";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeConfig {
     pub name: Option<String>,
@@ -32,7 +34,7 @@ impl_client_trait!(
     (
         prepare_chat_completions,
         claude_chat_completions,
-        claude_chat_completions_streaming
+        claude_chat_events
     ),
     (noop_prepare_embeddings, noop_embeddings),
     (noop_prepare_rerank, noop_rerank),
@@ -51,7 +53,7 @@ fn prepare_chat_completions(
 
     let mut request_data = RequestData::new(url, body);
 
-    request_data.header("anthropic-version", "2023-06-01");
+    request_data.header("anthropic-version", CLAUDE_API_VERSION);
     request_data.header("x-api-key", api_key);
 
     Ok(request_data)
@@ -82,7 +84,9 @@ pub async fn claude_chat_completions(
 struct ClaudeStreamState {
     active_block: Option<ClaudeContentBlock>,
     completed_tool_calls: Vec<ToolCall>,
-    output: String,
+    // Buffered in arrival order and released only at message_stop, so a
+    // stream that errors or is refused mid-flight never leaks partial output.
+    buffered: Vec<ChatEvent>,
     terminal_stop_reason: Option<String>,
 }
 
@@ -113,30 +117,21 @@ impl ClaudeStreamState {
                 active.index()
             );
         }
-        match active {
-            ClaudeContentBlock::Thinking { emitted: true, .. } => {
-                self.output.push_str("\n</think>\n\n");
-            }
-            ClaudeContentBlock::ToolUse(tool_call) => {
-                self.completed_tool_calls
-                    .push(tool_call.into_tool_call()?);
-            }
-            _ => {}
+        if let ClaudeContentBlock::ToolUse(tool_call) = active {
+            self.completed_tool_calls.push(tool_call.into_tool_call()?);
         }
         Ok(())
     }
 
     fn set_terminal_stop_reason(&mut self, stop_reason: &str) -> Result<()> {
         if let Some(previous) = self.terminal_stop_reason.as_deref() {
-            bail!(
-                "Claude sent multiple terminal stop reasons: {previous} and {stop_reason}"
-            );
+            bail!("Claude sent multiple terminal stop reasons: {previous} and {stop_reason}");
         }
         self.terminal_stop_reason = Some(stop_reason.to_string());
         Ok(())
     }
 
-    fn finish_message(&mut self, handler: &mut SseHandler) -> Result<()> {
+    fn finish_message(&mut self, events: &mut Vec<ChatEvent>) -> Result<()> {
         if let Some(active) = self.active_block.as_ref() {
             bail!(
                 "Claude message_stop arrived before {} content block {} stopped",
@@ -147,9 +142,9 @@ impl ClaudeStreamState {
         if self.terminal_stop_reason.is_none() {
             bail!("Claude message_stop arrived before a terminal stop_reason");
         }
-        handler.text(&std::mem::take(&mut self.output))?;
+        events.append(&mut self.buffered);
         for tool_call in std::mem::take(&mut self.completed_tool_calls) {
-            handler.tool_call(tool_call)?;
+            events.push(ChatEvent::ToolCall(tool_call));
         }
         Ok(())
     }
@@ -158,7 +153,7 @@ impl ClaudeStreamState {
 #[derive(Debug)]
 enum ClaudeContentBlock {
     Text { index: u64 },
-    Thinking { index: u64, emitted: bool },
+    Thinking { index: u64 },
     ToolUse(PendingClaudeToolCall),
     Unknown { index: u64 },
 }
@@ -166,9 +161,7 @@ enum ClaudeContentBlock {
 impl ClaudeContentBlock {
     fn index(&self) -> u64 {
         match self {
-            Self::Text { index }
-            | Self::Thinking { index, .. }
-            | Self::Unknown { index } => *index,
+            Self::Text { index } | Self::Thinking { index } | Self::Unknown { index } => *index,
             Self::ToolUse(tool_call) => tool_call.index,
         }
     }
@@ -262,28 +255,39 @@ fn catch_claude_error(data: &Value, status: u16) -> Result<()> {
     if (200..300).contains(&status) {
         return Ok(());
     }
-    if let Some(error) = data["error"].as_object() {
+    let mut hint = None;
+    let message = if let Some(error) = data["error"].as_object() {
         let message = error
             .get("message")
             .and_then(Value::as_str)
             .and_then(sanitize_claude_error_message);
         if let Some(error_type) = error.get("type").and_then(Value::as_str) {
-            if let Some(message) = message {
-                bail!("Claude request failed (status: {status}, type: {error_type}): {message}");
+            hint = Some(error_type.to_string());
+            match message {
+                Some(message) => format!(
+                    "Claude request failed (status: {status}, type: {error_type}): {message}"
+                ),
+                None => format!("Claude request failed (status: {status}, type: {error_type})"),
             }
-            bail!("Claude request failed (status: {status}, type: {error_type})");
-        }
-        if let Some(error_code) = error.get("code").and_then(Value::as_str) {
-            if let Some(message) = message {
-                bail!("Claude request failed (status: {status}, code: {error_code}): {message}");
+        } else if let Some(error_code) = error.get("code").and_then(Value::as_str) {
+            hint = Some(error_code.to_string());
+            match message {
+                Some(message) => format!(
+                    "Claude request failed (status: {status}, code: {error_code}): {message}"
+                ),
+                None => format!("Claude request failed (status: {status}, code: {error_code})"),
             }
-            bail!("Claude request failed (status: {status}, code: {error_code})");
+        } else {
+            match message {
+                Some(message) => format!("Claude request failed (status: {status}): {message}"),
+                None => format!("Claude request failed (status: {status})"),
+            }
         }
-        if let Some(message) = message {
-            bail!("Claude request failed (status: {status}): {message}");
-        }
-    }
-    bail!("Claude request failed (status: {status})");
+    } else {
+        format!("Claude request failed (status: {status})")
+    };
+    let kind = classify_provider_error(status, hint.as_deref());
+    Err(ProviderError::new(kind, message, Some(status)).into())
 }
 
 fn sanitize_claude_error_message(message: &str) -> Option<String> {
@@ -305,12 +309,18 @@ fn sanitize_claude_error_message(message: &str) -> Option<String> {
     (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
 
+fn refusal_error(message: String) -> anyhow::Error {
+    ProviderError::new(ProviderErrorKind::Refusal, message, None).into()
+}
+
 fn check_claude_response(data: &Value) -> Result<()> {
     if let Some(reason) = vertex_block_reason(data) {
-        bail!("Vertex AI blocked the request (reason: {reason})");
+        return Err(refusal_error(format!(
+            "Vertex AI blocked the request (reason: {reason})"
+        )));
     }
     if data["stop_reason"].as_str() == Some("refusal") {
-        bail!("{}", claude_refusal_message(&data["stop_details"]));
+        return Err(refusal_error(claude_refusal_message(&data["stop_details"])));
     }
     if data["content"]
         .as_array()
@@ -323,21 +333,25 @@ fn check_claude_response(data: &Value) -> Result<()> {
 
 fn handle_claude_stream_message(
     state: &mut ClaudeStreamState,
-    handler: &mut SseHandler,
+    events: &mut Vec<ChatEvent>,
     event: &str,
     message: &str,
 ) -> Result<bool> {
     if event == "vertex-block-event" {
         if let Ok(data) = serde_json::from_str::<Value>(message) {
             if let Some(reason) = vertex_block_reason(&data) {
-                bail!("Vertex AI blocked the request (reason: {reason})");
+                return Err(refusal_error(format!(
+                    "Vertex AI blocked the request (reason: {reason})"
+                )));
             }
         }
-        bail!("Vertex AI blocked the request");
+        return Err(refusal_error("Vertex AI blocked the request".to_string()));
     }
     let data: Value = serde_json::from_str(message).context("Invalid Claude streaming response")?;
     if let Some(reason) = vertex_block_reason(&data) {
-        bail!("Vertex AI blocked the request (reason: {reason})");
+        return Err(refusal_error(format!(
+            "Vertex AI blocked the request (reason: {reason})"
+        )));
     }
     let Some(typ) = data["type"].as_str() else {
         return Ok(false);
@@ -356,10 +370,7 @@ fn handle_claude_stream_message(
                 .context("Claude content_block_start is missing an index")?;
             let block = match block_type {
                 "text" => ClaudeContentBlock::Text { index },
-                "thinking" => ClaudeContentBlock::Thinking {
-                    index,
-                    emitted: false,
-                },
+                "thinking" => ClaudeContentBlock::Thinking { index },
                 "tool_use" => {
                     let name = data["content_block"]["name"]
                         .as_str()
@@ -368,10 +379,10 @@ fn handle_claude_stream_message(
                         .as_str()
                         .context("Claude tool_use content block is malformed")?;
                     ClaudeContentBlock::ToolUse(PendingClaudeToolCall {
-                    index,
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    arguments: String::new(),
+                        index,
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: String::new(),
                     })
                 }
                 _ => ClaudeContentBlock::Unknown { index },
@@ -399,20 +410,13 @@ fn handle_claude_stream_message(
                     let text = data["delta"]["text"]
                         .as_str()
                         .context("Claude text delta is malformed")?;
-                    state.output.push_str(text);
+                    state.buffered.push(ChatEvent::Text(text.to_string()));
                 }
-                (
-                    ClaudeContentBlock::Thinking { emitted, .. },
-                    ClaudeDeltaKind::Thinking,
-                ) => {
+                (ClaudeContentBlock::Thinking { .. }, ClaudeDeltaKind::Thinking) => {
                     let text = data["delta"]["thinking"]
                         .as_str()
                         .context("Claude thinking delta is malformed")?;
-                    if !*emitted {
-                        state.output.push_str("<think>\n");
-                        *emitted = true;
-                    }
-                    state.output.push_str(text);
+                    state.buffered.push(ChatEvent::Reasoning(text.to_string()));
                 }
                 (ClaudeContentBlock::Thinking { .. }, ClaudeDeltaKind::Signature) => {}
                 (ClaudeContentBlock::ToolUse(tool_call), ClaudeDeltaKind::ToolJson) => {
@@ -453,7 +457,7 @@ fn handle_claude_stream_message(
             }
         }
         "message_stop" => {
-            state.finish_message(handler)?;
+            state.finish_message(events)?;
             return Ok(true);
         }
         "error" => {
@@ -471,20 +475,28 @@ fn handle_claude_stream_message(
     Ok(false)
 }
 
-pub async fn claude_chat_completions_streaming(
+pub async fn claude_chat_events(
     builder: RequestBuilder,
-    handler: &mut SseHandler,
     _model: &Model,
-) -> Result<()> {
+) -> Result<ChatEventStream> {
     let mut state = ClaudeStreamState::default();
-    sse_stream_sanitized(
+    Ok(sse_chat_event_stream(
         builder,
-        |message: SseMmessage| {
-            handle_claude_stream_message(&mut state, handler, &message.event, &message.data)
+        move |message: SseMessage, events: &mut Vec<ChatEvent>| {
+            handle_claude_stream_message(&mut state, events, &message.event, &message.data)
         },
         catch_claude_error,
-    )
-    .await
+        true,
+    ))
+}
+
+#[cfg(test)]
+async fn stream_into_handler(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+    model: &Model,
+) -> Result<()> {
+    drive_chat_events(claude_chat_events(builder, model).await?, handler).await
 }
 
 pub fn claude_build_chat_completions_body(
@@ -737,19 +749,19 @@ mod tests {
 
     fn handle_value(
         state: &mut ClaudeStreamState,
-        handler: &mut SseHandler,
+        events: &mut Vec<ChatEvent>,
         value: Value,
     ) -> Result<bool> {
-        handle_event_value(state, handler, "message", value)
+        handle_event_value(state, events, "message", value)
     }
 
     fn handle_event_value(
         state: &mut ClaudeStreamState,
-        handler: &mut SseHandler,
+        events: &mut Vec<ChatEvent>,
         event: &str,
         value: Value,
     ) -> Result<bool> {
-        handle_claude_stream_message(state, handler, event, &value.to_string())
+        handle_claude_stream_message(state, events, event, &value.to_string())
     }
 
     #[test]
@@ -888,12 +900,9 @@ mod tests {
         .to_string();
         let builder = response_fixture_builder("529 Overloaded", "application/json", &body).await?;
 
-        let err = claude_chat_completions(
-            builder,
-            &Model::new("claude", "test-model"),
-        )
-        .await
-        .expect_err("non-success Claude HTTP response must fail");
+        let err = claude_chat_completions(builder, &Model::new("claude", "test-model"))
+            .await
+            .expect_err("non-success Claude HTTP response must fail");
 
         assert_eq!(
             err.to_string(),
@@ -904,12 +913,12 @@ mod tests {
 
     #[test]
     fn streaming_error_is_readable_and_does_not_dispatch_partial_output() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":10,
@@ -918,17 +927,17 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":10,"delta":{"type":"text_delta","text":"staged answer"}}),
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_stop","index":10}),
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":0,
@@ -937,7 +946,7 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":0,"delta":{"partial_json":"{\"query\":"}}),
         )?;
         let provider_message = format!("bad\nmodel\u{1b}[31m{}", "é".repeat(2000));
@@ -945,7 +954,7 @@ mod tests {
             .expect("provider message must remain after sanitization");
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"error",
                 "error":{"type":"overloaded_error","message":provider_message}
@@ -955,31 +964,23 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            format!(
-                "Claude streaming request failed (type: overloaded_error): {expected_message}"
-            )
+            format!("Claude streaming request failed (type: overloaded_error): {expected_message}")
         );
         assert!(!err.to_string().contains('\n'));
         assert!(!err.to_string().contains('\u{1b}'));
         assert_eq!(expected_message.len(), 2048);
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn streaming_refusal_before_output_without_details_is_transactional() {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": "refusal", "stop_details": null}
@@ -988,18 +989,12 @@ mod tests {
         .expect_err("refusal must terminate the stream");
 
         assert_eq!(err.to_string(), "Claude refused the request");
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
     }
 
     #[test]
     fn streaming_refusal_discards_text_thinking_and_completed_tool() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         for value in [
@@ -1025,16 +1020,13 @@ mod tests {
             json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"value\":1}"}}),
             json!({"type":"content_block_stop","index":2}),
         ] {
-            handle_value(&mut state, &mut handler, value)?;
+            handle_value(&mut state, &mut events, value)?;
         }
 
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(events.is_empty());
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"message_delta",
                 "delta": {
@@ -1054,24 +1046,18 @@ mod tests {
         );
         assert!(!err.to_string().contains("partial answer"));
         assert!(!err.to_string().contains("side_effect"));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn streaming_refusal_discards_pending_tool_with_null_detail_fields() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":3,
@@ -1080,12 +1066,12 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":3,"delta":{"partial_json":"{\"pending\":"}}),
         )?;
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"message_delta",
                 "delta": {
@@ -1097,24 +1083,18 @@ mod tests {
         .expect_err("refusal must discard a pending tool call");
 
         assert_eq!(err.to_string(), "Claude refused the request");
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn streaming_invalid_json_discards_staged_text() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":0,
@@ -1123,31 +1103,22 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"staged answer"}}),
         )?;
-        let err = handle_claude_stream_message(
-            &mut state,
-            &mut handler,
-            "message",
-            "{not-json",
-        )
-        .expect_err("invalid JSON must terminate the transaction");
+        let err = handle_claude_stream_message(&mut state, &mut events, "message", "{not-json")
+            .expect_err("invalid JSON must terminate the transaction");
 
-        assert!(err.to_string().starts_with("Invalid Claude streaming response"));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(err
+            .to_string()
+            .starts_with("Invalid Claude streaming response"));
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn streaming_invalid_tool_json_does_not_expose_arguments() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         for value in [
@@ -1169,11 +1140,11 @@ mod tests {
                 "delta":{"type":"input_json_delta","partial_json":"{\"secret\":\"must not escape\""}
             }),
         ] {
-            handle_value(&mut state, &mut handler, value)?;
+            handle_value(&mut state, &mut events, value)?;
         }
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_stop","index":4}),
         )
         .expect_err("invalid tool JSON must abort the transaction");
@@ -1184,24 +1155,18 @@ mod tests {
         );
         assert!(!err.to_string().contains("secret_tool"));
         assert!(!err.to_string().contains("must not escape"));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn streaming_fallback_block_is_rejected_without_staged_text() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":0,
@@ -1210,12 +1175,12 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre-fallback partial"}}),
         )?;
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":1,
@@ -1228,24 +1193,18 @@ mod tests {
             err.to_string(),
             "Claude server-side fallback responses are not supported"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn vertex_stream_block_event_discards_staged_text() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":0,
@@ -1254,12 +1213,12 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"blocked partial"}}),
         )?;
         let err = handle_event_value(
             &mut state,
-            &mut handler,
+            &mut events,
             "vertex-block-event",
             json!({"promptFeedback":{"blockReason":"PROHIBITED_CONTENT"}}),
         )
@@ -1269,24 +1228,18 @@ mod tests {
             err.to_string(),
             "Vertex AI blocked the request (reason: PROHIBITED_CONTENT)"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn malformed_vertex_stream_block_event_is_still_explicit() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({
                 "type":"content_block_start",
                 "index":0,
@@ -1295,31 +1248,21 @@ mod tests {
         )?;
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"blocked partial"}}),
         )?;
-        let err = handle_claude_stream_message(
-            &mut state,
-            &mut handler,
-            "vertex-block-event",
-            "not-json",
-        )
-        .expect_err("the SSE event name itself identifies a Vertex block");
+        let err =
+            handle_claude_stream_message(&mut state, &mut events, "vertex-block-event", "not-json")
+                .expect_err("the SSE event name itself identifies a Vertex block");
 
         assert_eq!(err.to_string(), "Vertex AI blocked the request");
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn terminal_message_does_not_commit_an_unstopped_text_block() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         for value in [
@@ -1335,32 +1278,22 @@ mod tests {
             }),
             json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
         ] {
-            handle_value(&mut state, &mut handler, value)?;
+            handle_value(&mut state, &mut events, value)?;
         }
-        let err = handle_value(
-            &mut state,
-            &mut handler,
-            json!({"type":"message_stop"}),
-        )
-        .expect_err("message_stop must not commit an active text block");
+        let err = handle_value(&mut state, &mut events, json!({"type":"message_stop"}))
+            .expect_err("message_stop must not commit an active text block");
 
         assert_eq!(
             err.to_string(),
             "Claude message_stop arrived before text content block 0 stopped"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
     fn mismatched_content_block_stop_discards_staged_text() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         for value in [
@@ -1375,23 +1308,17 @@ mod tests {
                 "delta":{"type":"text_delta","text":"mismatched partial"}
             }),
         ] {
-            handle_value(&mut state, &mut handler, value)?;
+            handle_value(&mut state, &mut events, value)?;
         }
         let err = handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"content_block_stop","index":1}),
         )
         .expect_err("a different block index must not close the active text block");
 
         assert_eq!(err.to_string(), "Claude text block 0 stopped by block 1");
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
         Ok(())
     }
 
@@ -1409,11 +1336,11 @@ mod tests {
                 "delta":{"type":"thinking_delta","thinking":"wrong kind"}
             }),
         ] {
-            let (mut handler, mut rx) = test_handler();
+            let mut events = Vec::new();
             let mut state = ClaudeStreamState::default();
             handle_value(
                 &mut state,
-                &mut handler,
+                &mut events,
                 json!({
                     "type":"content_block_start",
                     "index":0,
@@ -1421,15 +1348,9 @@ mod tests {
                 }),
             )?;
 
-            handle_value(&mut state, &mut handler, invalid_event)
+            handle_value(&mut state, &mut events, invalid_event)
                 .expect_err("recognized content-block lifecycle mismatch must fail");
-            assert!(matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ));
-            let (text, calls) = handler.take();
-            assert!(text.is_empty());
-            assert!(calls.is_empty());
+            assert!(events.is_empty());
         }
         Ok(())
     }
@@ -1447,13 +1368,9 @@ mod tests {
         let builder = response_fixture_builder("529 Overloaded", "application/json", &body).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = claude_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("claude", "test-model"),
-        )
-        .await
-        .expect_err("non-success Claude SSE response must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model"))
+            .await
+            .expect_err("non-success Claude SSE response must fail");
 
         assert_eq!(
             err.to_string(),
@@ -1484,21 +1401,12 @@ mod tests {
     #[tokio::test]
     async fn invalid_sse_content_type_does_not_expose_body() -> Result<()> {
         const BODY_SENTINEL: &str = "INVALID_CONTENT_TYPE_BODY_SENTINEL";
-        let builder = response_fixture_builder(
-            "200 OK",
-            "application/json",
-            BODY_SENTINEL,
-        )
-        .await?;
+        let builder = response_fixture_builder("200 OK", "application/json", BODY_SENTINEL).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = claude_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("claude", "test-model"),
-        )
-        .await
-        .expect_err("Claude SSE response with a non-event-stream type must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model"))
+            .await
+            .expect_err("Claude SSE response with a non-event-stream type must fail");
 
         assert_eq!(
             err.to_string(),
@@ -1530,15 +1438,14 @@ mod tests {
         let builder = sse_fixture_builder(&format!("data: {tool_start}\n\n")).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = claude_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("claude", "test-model"),
-        )
-        .await
-        .expect_err("EOF before content_block_stop and message_stop must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model"))
+            .await
+            .expect_err("EOF before content_block_stop and message_stop must fail");
 
-        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert_eq!(
+            err.to_string(),
+            "SSE stream ended before protocol completion"
+        );
         assert!(handler.tool_calls().is_empty());
         assert!(matches!(
             rx.try_recv(),
@@ -1572,15 +1479,14 @@ mod tests {
         let builder = sse_fixture_builder(&body).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = claude_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("claude", "test-model"),
-        )
-        .await
-        .expect_err("EOF after content_block_stop but before message_stop must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model"))
+            .await
+            .expect_err("EOF after content_block_stop but before message_stop must fail");
 
-        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert_eq!(
+            err.to_string(),
+            "SSE stream ended before protocol completion"
+        );
         assert!(handler.tool_calls().is_empty());
         assert!(matches!(
             rx.try_recv(),
@@ -1613,15 +1519,14 @@ mod tests {
         let builder = sse_fixture_builder(&body).await?;
         let (mut handler, mut rx) = test_handler();
 
-        let err = claude_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("claude", "test-model"),
-        )
-        .await
-        .expect_err("EOF before terminal stop_reason and message_stop must fail");
+        let err = stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model"))
+            .await
+            .expect_err("EOF before terminal stop_reason and message_stop must fail");
 
-        assert_eq!(err.to_string(), "SSE stream ended before protocol completion");
+        assert_eq!(
+            err.to_string(),
+            "SSE stream ended before protocol completion"
+        );
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1634,7 +1539,7 @@ mod tests {
 
     #[test]
     fn message_stop_without_terminal_reason_does_not_commit() {
-        let (mut handler, mut rx) = test_handler();
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         for value in [
@@ -1650,26 +1555,16 @@ mod tests {
             }),
             json!({"type":"content_block_stop","index":0}),
         ] {
-            handle_value(&mut state, &mut handler, value).unwrap();
+            handle_value(&mut state, &mut events, value).unwrap();
         }
-        let err = handle_value(
-            &mut state,
-            &mut handler,
-            json!({"type":"message_stop"}),
-        )
-        .expect_err("message_stop without message_delta.stop_reason must fail");
+        let err = handle_value(&mut state, &mut events, json!({"type":"message_stop"}))
+            .expect_err("message_stop without message_delta.stop_reason must fail");
 
         assert_eq!(
             err.to_string(),
             "Claude message_stop arrived before a terminal stop_reason"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        let (text, calls) = handler.take();
-        assert!(text.is_empty());
-        assert!(calls.is_empty());
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
@@ -1696,12 +1591,7 @@ mod tests {
         let builder = sse_fixture_builder(&body).await?;
         let (mut handler, _rx) = test_handler();
 
-        claude_chat_completions_streaming(
-            builder,
-            &mut handler,
-            &Model::new("claude", "test-model"),
-        )
-        .await?;
+        stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert!(text.is_empty());
@@ -1712,8 +1602,8 @@ mod tests {
     }
 
     #[test]
-    fn successful_content_reasoning_and_tool_stream_is_unchanged() -> Result<()> {
-        let (mut handler, mut rx) = test_handler();
+    fn successful_content_reasoning_and_tool_stream_commits_at_message_stop() -> Result<()> {
+        let mut events = Vec::new();
         let mut state = ClaudeStreamState::default();
 
         for value in [
@@ -1753,47 +1643,111 @@ mod tests {
             }),
             json!({"type":"content_block_stop","index":3}),
         ] {
-            handle_value(&mut state, &mut handler, value)?;
+            handle_value(&mut state, &mut events, value)?;
         }
 
-        assert!(handler.tool_calls().is_empty());
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(events.is_empty());
         handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
         )?;
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        handle_value(
+        assert!(events.is_empty());
+        assert!(handle_value(
             &mut state,
-            &mut handler,
+            &mut events,
             json!({"type":"message_stop"}),
-        )?;
+        )?);
 
-        match rx.try_recv() {
-            Ok(SseEvent::Text(text)) => {
-                assert_eq!(text, "<think>\nreason\n</think>\n\nanswer")
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0], ChatEvent::Reasoning("reason".into()));
+        assert_eq!(events[1], ChatEvent::Text("answer".into()));
+        match (&events[2], &events[3]) {
+            (ChatEvent::ToolCall(first), ChatEvent::ToolCall(second)) => {
+                assert_eq!(first.name, "first");
+                assert_eq!(first.arguments, json!({"value":1}));
+                assert_eq!(first.id.as_deref(), Some("tool_one"));
+                assert_eq!(second.name, "second");
+                assert_eq!(second.arguments, json!({}));
+                assert_eq!(second.id.as_deref(), Some("tool_two"));
             }
-            other => panic!("expected one committed text event, got {other:?}"),
+            other => panic!("expected two tool call events, got {other:?}"),
         }
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_and_text_reach_handler_wrapped_in_think_tags() -> Result<()> {
+        let events = [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"thinking_delta","thinking":"reason"}
+            }),
+            json!({"type":"content_block_stop","index":0}),
+            json!({
+                "type":"content_block_start",
+                "index":1,
+                "content_block":{"type":"text","text":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":1,
+                "delta":{"type":"text_delta","text":"answer"}
+            }),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let builder = sse_fixture_builder(&body).await?;
+        let (mut handler, _rx) = test_handler();
+
+        stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model")).await?;
 
         let (text, calls) = handler.take();
         assert_eq!(text, "<think>\nreason\n</think>\n\nanswer");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "first");
-        assert_eq!(calls[0].arguments, json!({"value":1}));
-        assert_eq!(calls[1].name, "second");
-        assert_eq!(calls[1].arguments, json!({}));
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_stream_closes_the_think_tag() -> Result<()> {
+        let events = [
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":""}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"thinking_delta","thinking":"reason"}
+            }),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let builder = sse_fixture_builder(&body).await?;
+        let (mut handler, _rx) = test_handler();
+
+        stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model")).await?;
+
+        let (text, calls) = handler.take();
+        assert_eq!(text, "<think>\nreason\n</think>\n\n");
+        assert!(calls.is_empty());
         Ok(())
     }
 }

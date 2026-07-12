@@ -1,0 +1,13 @@
+{
+  "transport": "json",
+  "body_lines": [
+    "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]},",
+    "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"search\",\"args\":{\"query\":\"rust\"}}}]}}]}]"
+  ],
+  "expect": {
+    "events": [
+      { "text": "hello" },
+      { "tool_call": { "name": "search", "arguments": { "query": "rust" }, "id": null } }
+    ]
+  }
+}

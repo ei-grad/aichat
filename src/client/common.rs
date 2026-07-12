@@ -29,6 +29,15 @@ pub static ALL_PROVIDER_MODELS: LazyLock<Vec<ProviderModels>> = LazyLock::new(||
         .unwrap_or_else(|| serde_yaml::from_str(MODELS_YAML).unwrap())
 });
 
+/// Catalog endpoint of a provider served by the generic `openai-compatible`
+/// client, or `None` for unknown/native providers.
+pub(crate) fn compat_provider_api_base(client_name: &str) -> Option<&'static str> {
+    ALL_PROVIDER_MODELS
+        .iter()
+        .find(|v| v.provider == client_name)
+        .and_then(|v| v.api_base.as_deref())
+}
+
 static EMBEDDING_MODEL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"((^|/)(bge-|e5-|uae-|gte-|text-)|embed|multilingual|minilm)").unwrap()
 });
@@ -218,7 +227,7 @@ pub trait Client: Sync + Send {
         }
         let client = self.build_client()?;
         let data = input.prepare_completion_data(self.model(), false)?;
-        self.chat_completions_inner(&client, data)
+        retry_request(|| self.chat_completions_inner(&client, data.clone()))
             .await
             .with_context(|| "Failed to call chat-completions api")
     }
@@ -239,7 +248,9 @@ pub trait Client: Sync + Send {
                 }
                 let client = self.build_client()?;
                 let data = input.prepare_completion_data(self.model(), true)?;
-                self.chat_completions_streaming_inner(&client, handler, data).await
+                let stream =
+                    retry_chat_events(|| self.chat_events_inner(&client, data.clone())).await?;
+                drive_chat_events(stream, handler).await
             } => {
                 handler.done();
                 ret.with_context(|| "Failed to call chat-completions api")
@@ -253,30 +264,41 @@ pub trait Client: Sync + Send {
 
     async fn embeddings(&self, data: &EmbeddingsData) -> Result<Vec<Vec<f32>>> {
         let client = self.build_client()?;
-        self.embeddings_inner(&client, data)
+        retry_request(|| self.embeddings_inner(&client, data))
             .await
             .context("Failed to call embeddings api")
     }
 
     async fn rerank(&self, data: &RerankData) -> Result<RerankOutput> {
         let client = self.build_client()?;
-        self.rerank_inner(&client, data)
+        retry_request(|| self.rerank_inner(&client, data))
             .await
             .context("Failed to call rerank api")
     }
 
+    /// Non-streaming completion. Providers with a dedicated non-streaming
+    /// wire format override this; the default collects the event stream, so
+    /// a provider only has to implement `chat_events_inner`.
     async fn chat_completions_inner(
         &self,
         client: &ReqwestClient,
-        data: ChatCompletionsData,
-    ) -> Result<ChatCompletionsOutput>;
+        mut data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        data.stream = true;
+        let stream = self.chat_events_inner(client, data).await?;
+        let (text, tool_calls) = collect_chat_events(stream).await?;
+        Ok(ChatCompletionsOutput {
+            text,
+            tool_calls,
+            ..Default::default()
+        })
+    }
 
-    async fn chat_completions_streaming_inner(
+    async fn chat_events_inner(
         &self,
         client: &ReqwestClient,
-        handler: &mut SseHandler,
         data: ChatCompletionsData,
-    ) -> Result<()>;
+    ) -> Result<ChatEventStream>;
 
     async fn embeddings_inner(
         &self,
@@ -423,7 +445,7 @@ impl RequestData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChatCompletionsData {
     pub messages: Vec<Message>,
     pub temperature: Option<f64>,
@@ -514,11 +536,7 @@ pub async fn create_config(
 pub async fn create_openai_compatible_client_config(
     client: &str,
 ) -> Result<Option<(String, Value)>> {
-    let api_base = super::OPENAI_COMPATIBLE_PROVIDERS
-        .into_iter()
-        .find(|(name, _)| client == *name)
-        .map(|(_, api_base)| api_base)
-        .unwrap_or("http(s)://{API_ADDR}/v1");
+    let api_base = compat_provider_api_base(client).unwrap_or("http(s)://{API_ADDR}/v1");
 
     let name = if client == OpenAICompatibleClient::NAME {
         let value = prompt_input_string("Provider Name", true, None)?;
@@ -641,43 +659,58 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
         return Ok(());
     }
     debug!("Invalid response, status: {status}, data: {data}");
+    let (message, hint) = extract_error_message(data, status);
+    let kind = classify_provider_error(status, hint.as_deref());
+    Err(ProviderError::new(kind, message, Some(status)).into())
+}
+
+/// Probe the known provider error response shapes. Returns the user-facing
+/// message (formats preserved from the pre-`ProviderError` string errors) and
+/// the provider-reported error type/code usable as a classification hint.
+fn extract_error_message(data: &Value, status: u16) -> (String, Option<String>) {
     if let Some(error) = data["error"].as_object() {
         if let (Some(typ), Some(message)) = (
             json_str_from_map(error, "type"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (type: {typ})");
-        } else if let (Some(typ), Some(message)) = (
+            return (format!("{message} (type: {typ})"), Some(typ.to_string()));
+        } else if let (Some(code), Some(message)) = (
             json_str_from_map(error, "code"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (code: {typ})");
+            return (format!("{message} (code: {code})"), Some(code.to_string()));
         }
     } else if let Some(error) = data["errors"][0].as_object() {
         if let (Some(code), Some(message)) = (
             error.get("code").and_then(|v| v.as_u64()),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (status: {code})")
+            return (format!("{message} (status: {code})"), None);
         }
     } else if let Some(error) = data[0]["error"].as_object() {
-        if let (Some(status), Some(message)) = (
+        if let (Some(error_status), Some(message)) = (
             json_str_from_map(error, "status"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (status: {status})")
+            return (
+                format!("{message} (status: {error_status})"),
+                Some(error_status.to_string()),
+            );
         }
     } else if let (Some(detail), Some(status)) = (data["detail"].as_str(), data["status"].as_i64())
     {
-        bail!("{detail} (status: {status})");
+        return (format!("{detail} (status: {status})"), None);
     } else if let (Some(detail), Some(code)) = (data["detail"].as_str(), data["code"].as_i64()) {
-        bail!("{detail} (status: {code})");
+        return (format!("{detail} (status: {code})"), None);
     } else if let Some(error) = data["error"].as_str() {
-        bail!("{error}");
+        return (error.to_string(), None);
     } else if let Some(message) = data["message"].as_str() {
-        bail!("{message}");
+        return (message.to_string(), None);
     }
-    bail!("Invalid response data: {data} (status: {status})");
+    (
+        format!("Invalid response data: {data} (status: {status})"),
+        None,
+    )
 }
 
 pub fn json_str_from_map<'a>(

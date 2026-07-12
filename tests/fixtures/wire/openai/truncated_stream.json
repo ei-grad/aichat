@@ -1,0 +1,14 @@
+{
+  "transport": "sse",
+  "body_lines": [
+    "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}",
+    "",
+    ""
+  ],
+  "expect": {
+    "error": {
+      "message": "SSE stream ended before protocol completion",
+      "transient": false
+    }
+  }
+}

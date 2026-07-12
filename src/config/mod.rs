@@ -11,8 +11,8 @@ pub use self::role::{
 use self::session::Session;
 
 use crate::client::{
-    create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
-    Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
+    compat_provider_api_base, create_client_config, list_client_types, list_models, ClientConfig,
+    MessageContentToolCalls, Model, ModelType, ProviderModels,
 };
 use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
@@ -149,6 +149,11 @@ pub struct Config {
     pub clients: Vec<ClientConfig>,
 
     #[serde(skip)]
+    pub(crate) client_names_cache: std::sync::OnceLock<Vec<String>>,
+    #[serde(skip)]
+    pub(crate) all_models_cache: std::sync::OnceLock<Vec<Model>>,
+
+    #[serde(skip)]
     pub macro_flag: bool,
     #[serde(skip)]
     pub info_flag: bool,
@@ -222,6 +227,9 @@ impl Default for Config {
             sync_models_url: None,
 
             clients: vec![],
+
+            client_names_cache: Default::default(),
+            all_models_cache: Default::default(),
 
             macro_flag: false,
             info_flag: false,
@@ -2243,9 +2251,7 @@ impl Config {
             Some((v, _)) => v,
             _ => model_id,
         };
-        let is_openai_compatible = OPENAI_COMPATIBLE_PROVIDERS
-            .into_iter()
-            .any(|(name, _)| provider == name);
+        let is_openai_compatible = compat_provider_api_base(provider).is_some();
         let client = if is_openai_compatible {
             json!({ "type": "openai-compatible", "name": provider })
         } else {

@@ -484,7 +484,32 @@ impl ModelData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModels {
     pub provider: String,
+    /// Endpoint for providers served by the generic `openai-compatible`
+    /// client; presence makes the provider selectable as a client type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    /// Wire protocol the provider's endpoint speaks.
+    #[serde(default, skip_serializing_if = "WireFormat::is_default")]
+    pub wire_format: WireFormat,
     pub models: Vec<ModelData>,
+}
+
+/// Wire protocol dialect of a chat endpoint. Determines request body shape,
+/// URL path, auth header style, and streaming response parsing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireFormat {
+    #[default]
+    Openai,
+    Claude,
+    Gemini,
+    Cohere,
+}
+
+impl WireFormat {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 fn default_model_type() -> String {
