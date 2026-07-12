@@ -102,6 +102,142 @@ mod catalog_tests {
     }
 
     #[test]
+    fn openai_catalog_exposes_current_models_and_reasoning_efforts() {
+        let catalog = catalog();
+        let openai = provider(&catalog, "openai");
+        let expanded = Model::from_config("openai", "openai", &openai.models);
+
+        for (name, input_price, output_price) in [
+            ("gpt-5.6", 5.0, 30.0),
+            ("gpt-5.6-terra", 2.5, 15.0),
+            ("gpt-5.6-luna", 1.0, 6.0),
+        ] {
+            let base = model(openai, name);
+            assert_eq!(base.max_input_tokens, Some(1_050_000));
+            assert_eq!(base.max_output_tokens, Some(128_000));
+            assert_eq!(base.input_price, Some(input_price));
+            assert_eq!(base.output_price, Some(output_price));
+
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                let variant = expanded
+                    .iter()
+                    .find(|model| model.name() == format!("{name}:{effort}"))
+                    .unwrap_or_else(|| panic!("missing openai:{name}:{effort}"));
+                assert_eq!(variant.real_name(), name);
+                let body = patched_body(variant.data(), json!({"temperature": 0.4, "top_p": 0.8}));
+                assert_eq!(body["reasoning_effort"], effort);
+                assert!(body.get("temperature").is_none());
+                assert!(body.get("top_p").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_efforts_use_provider_specific_request_shapes() {
+        let mut data = ModelData::new("reasoning-model");
+        data.reasoning_efforts = vec!["medium".into()];
+
+        for provider_name in ["claude", "vertexai"] {
+            let models =
+                Model::from_config(provider_name, provider_name, std::slice::from_ref(&data));
+            let variant = models
+                .iter()
+                .find(|model| model.name() == "reasoning-model:medium")
+                .expect("missing reasoning effort variant");
+            let body = patched_body(variant.data(), json!({"temperature": 0.4, "top_p": 0.8}));
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "medium");
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("top_p").is_none());
+        }
+
+        let models = Model::from_config("bedrock", "bedrock", std::slice::from_ref(&data));
+        let variant = models
+            .iter()
+            .find(|model| model.name() == "reasoning-model:medium")
+            .expect("missing Bedrock reasoning effort variant");
+        let body = patched_body(
+            variant.data(),
+            json!({"inferenceConfig": {"temperature": 0.4, "topP": 0.8}}),
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "adaptive"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "medium"
+        );
+        assert!(body["inferenceConfig"].get("temperature").is_none());
+        assert!(body["inferenceConfig"].get("topP").is_none());
+
+        for provider_name in ["gemini", "vertexai"] {
+            let mut gemini = data.clone();
+            gemini.name = "gemini-reasoning-model".into();
+            let models = Model::from_config(provider_name, provider_name, &[gemini]);
+            let variant = models
+                .iter()
+                .find(|model| model.name() == "gemini-reasoning-model:medium")
+                .expect("missing Gemini reasoning effort variant");
+            let body = patched_body(variant.data(), json!({"generationConfig": {}}));
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                "medium"
+            );
+        }
+
+        let named = Model::from_config("work-claude", "claude", std::slice::from_ref(&data));
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[1].client_name(), "work-claude");
+        assert_eq!(named[1].name(), "reasoning-model:medium");
+
+        assert_eq!(Model::from_config("moonshot", "moonshot", &[data]).len(), 1);
+    }
+
+    #[test]
+    fn catalog_effort_variants_preserve_sampling_deletion_patches() {
+        let catalog = catalog();
+        for provider_name in ["claude", "vertexai"] {
+            let provider = provider(&catalog, provider_name);
+            let models = Model::from_config(provider_name, provider_name, &provider.models);
+            let variant = models
+                .iter()
+                .find(|model| model.name() == "claude-opus-4-7:medium")
+                .expect("missing catalog effort variant");
+            let body = patched_body(variant.data(), json!({"temperature": 0.4, "top_p": 0.8}));
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("top_p").is_none());
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "medium");
+
+            let fable = models
+                .iter()
+                .find(|model| model.name() == "claude-fable-5:medium")
+                .expect("missing Fable effort variant");
+            let body = patched_body(fable.data(), json!({}));
+            assert!(body.get("thinking").is_none());
+            assert_eq!(body["output_config"]["effort"], "medium");
+        }
+
+        let bedrock = provider(&catalog, "bedrock");
+        let models = Model::from_config("bedrock", "bedrock", &bedrock.models);
+        let variant = models
+            .iter()
+            .find(|model| model.name() == "us.anthropic.claude-opus-4-7:medium")
+            .expect("missing Bedrock catalog effort variant");
+        let body = patched_body(
+            variant.data(),
+            json!({"inferenceConfig": {"temperature": 0.4, "topP": 0.8}}),
+        );
+        assert!(body["inferenceConfig"].get("temperature").is_none());
+        assert!(body["inferenceConfig"].get("topP").is_none());
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "medium"
+        );
+    }
+
+    #[test]
     fn refreshed_catalog_tracks_gemini_and_minimax_lifecycle() {
         let catalog = catalog();
         let gemini = provider(&catalog, "gemini");

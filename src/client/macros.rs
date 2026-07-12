@@ -57,11 +57,11 @@ macro_rules! register_client {
                                 ($name == OpenAICompatibleClient::NAME
                                     && local_config.name.as_ref().map(|name| name.starts_with(&v.provider)).unwrap_or_default())
                         }) {
-                            return Model::from_config(client_name, &v.models);
+                            return Model::from_config(client_name, $name, &v.models);
                         }
                         vec![]
                     } else {
-                        Model::from_config(client_name, &local_config.models)
+                        Model::from_config(client_name, $name, &local_config.models)
                     }
                 }
 
