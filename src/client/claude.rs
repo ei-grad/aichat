@@ -263,14 +263,46 @@ fn catch_claude_error(data: &Value, status: u16) -> Result<()> {
         return Ok(());
     }
     if let Some(error) = data["error"].as_object() {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(sanitize_claude_error_message);
         if let Some(error_type) = error.get("type").and_then(Value::as_str) {
+            if let Some(message) = message {
+                bail!("Claude request failed (status: {status}, type: {error_type}): {message}");
+            }
             bail!("Claude request failed (status: {status}, type: {error_type})");
         }
         if let Some(error_code) = error.get("code").and_then(Value::as_str) {
+            if let Some(message) = message {
+                bail!("Claude request failed (status: {status}, code: {error_code}): {message}");
+            }
             bail!("Claude request failed (status: {status}, code: {error_code})");
+        }
+        if let Some(message) = message {
+            bail!("Claude request failed (status: {status}): {message}");
         }
     }
     bail!("Claude request failed (status: {status})");
+}
+
+fn sanitize_claude_error_message(message: &str) -> Option<String> {
+    const MAX_BYTES: usize = 2048;
+
+    let mut sanitized = String::with_capacity(message.len().min(MAX_BYTES));
+    for character in message.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if sanitized.len() + character.len_utf8() > MAX_BYTES {
+            break;
+        }
+        sanitized.push(character);
+    }
+    let sanitized = sanitized.trim();
+    (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
 
 fn check_claude_response(data: &Value) -> Result<()> {
@@ -426,6 +458,12 @@ fn handle_claude_stream_message(
         }
         "error" => {
             let error_type = data["error"]["type"].as_str().unwrap_or("unknown_error");
+            if let Some(message) = data["error"]["message"]
+                .as_str()
+                .and_then(sanitize_claude_error_message)
+            {
+                bail!("Claude streaming request failed (type: {error_type}): {message}");
+            }
             bail!("Claude streaming request failed (type: {error_type})");
         }
         _ => {}
@@ -839,7 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonstream_http_error_exposes_only_status_and_type() -> Result<()> {
+    async fn nonstream_http_error_exposes_sanitized_provider_message() -> Result<()> {
         const BODY_SENTINEL: &str = "NONSTREAM_HTTP_BODY_SENTINEL";
         let body = json!({
             "error": {
@@ -859,9 +897,8 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Claude request failed (status: 529, type: overloaded_error)"
+            "Claude request failed (status: 529, type: overloaded_error): NONSTREAM_HTTP_BODY_SENTINEL"
         );
-        assert!(!err.to_string().contains(BODY_SENTINEL));
         Ok(())
     }
 
@@ -903,21 +940,28 @@ mod tests {
             &mut handler,
             json!({"type":"content_block_delta","index":0,"delta":{"partial_json":"{\"query\":"}}),
         )?;
+        let provider_message = format!("bad\nmodel\u{1b}[31m{}", "é".repeat(2000));
+        let expected_message = sanitize_claude_error_message(&provider_message)
+            .expect("provider message must remain after sanitization");
         let err = handle_value(
             &mut state,
             &mut handler,
             json!({
                 "type":"error",
-                "error":{"type":"overloaded_error","message":"STREAM_ERROR_SENTINEL"}
+                "error":{"type":"overloaded_error","message":provider_message}
             }),
         )
         .expect_err("provider error must stop the stream");
 
         assert_eq!(
             err.to_string(),
-            "Claude streaming request failed (type: overloaded_error)"
+            format!(
+                "Claude streaming request failed (type: overloaded_error): {expected_message}"
+            )
         );
-        assert!(!err.to_string().contains("STREAM_ERROR_SENTINEL"));
+        assert!(!err.to_string().contains('\n'));
+        assert!(!err.to_string().contains('\u{1b}'));
+        assert_eq!(expected_message.len(), 2048);
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1391,7 +1435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_http_error_exposes_only_status_and_type() -> Result<()> {
+    async fn streaming_http_error_exposes_sanitized_provider_message() -> Result<()> {
         const BODY_SENTINEL: &str = "STREAM_HTTP_BODY_SENTINEL";
         let body = json!({
             "error": {
@@ -1413,9 +1457,8 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Claude request failed (status: 529, type: overloaded_error)"
+            "Claude request failed (status: 529, type: overloaded_error): STREAM_HTTP_BODY_SENTINEL"
         );
-        assert!(!err.to_string().contains(BODY_SENTINEL));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1424,6 +1467,18 @@ mod tests {
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn claude_error_message_is_terminal_safe_and_bounded() {
+        let message = format!("bad\nmodel\u{1b}[31m{}", "é".repeat(2000));
+        let sanitized = sanitize_claude_error_message(&message).expect("message must remain");
+
+        assert!(sanitized.starts_with("bad model [31m"));
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(sanitized.len() <= 2048);
+        assert!(sanitized.is_char_boundary(sanitized.len()));
     }
 
     #[tokio::test]
