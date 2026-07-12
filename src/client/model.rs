@@ -35,12 +35,31 @@ impl Model {
         }
     }
 
-    pub fn from_config(client_name: &str, models: &[ModelData]) -> Vec<Self> {
+    pub fn from_config(client_name: &str, provider_type: &str, models: &[ModelData]) -> Vec<Self> {
         models
             .iter()
-            .map(|v| Model {
-                client_name: client_name.to_string(),
-                data: v.clone(),
+            .flat_map(|data| {
+                let base = Model {
+                    client_name: client_name.to_string(),
+                    data: data.clone(),
+                };
+                let variants = data.reasoning_efforts.iter().filter_map(|effort| {
+                    let real_name = data.real_name.as_deref().unwrap_or(&data.name);
+                    let effort_patch = reasoning_effort_patch(provider_type, real_name, effort)?;
+                    let mut variant = data.clone();
+                    variant.name = format!("{}:{effort}", data.name);
+                    variant.real_name =
+                        Some(data.real_name.clone().unwrap_or_else(|| data.name.clone()));
+                    match &mut variant.patch {
+                        Some(patch) => merge_patch_values(patch, effort_patch),
+                        None => variant.patch = Some(effort_patch),
+                    }
+                    Some(Model {
+                        client_name: client_name.to_string(),
+                        data: variant,
+                    })
+                });
+                std::iter::once(base).chain(variants).collect::<Vec<_>>()
             })
             .collect()
     }
@@ -292,6 +311,91 @@ impl Model {
     }
 }
 
+fn reasoning_effort_patch(client_name: &str, model_name: &str, effort: &str) -> Option<Value> {
+    match client_name {
+        "openai" => Some(serde_json::json!({
+            "body": {
+                "temperature": null,
+                "top_p": null,
+                "reasoning_effort": effort,
+            }
+        })),
+        "gemini" => Some(serde_json::json!({
+            "body": {
+                "generationConfig": {
+                    "thinkingConfig": {"thinkingLevel": effort},
+                },
+            }
+        })),
+        "claude" if model_name.starts_with("claude-fable-5") => Some(serde_json::json!({
+            "body": {
+                "temperature": null,
+                "top_p": null,
+                "output_config": {"effort": effort},
+            }
+        })),
+        "claude" => Some(serde_json::json!({
+            "body": {
+                "temperature": null,
+                "top_p": null,
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": effort},
+            }
+        })),
+        "vertexai" if model_name.starts_with("gemini-") => Some(serde_json::json!({
+            "body": {
+                "generationConfig": {
+                    "thinkingConfig": {"thinkingLevel": effort},
+                },
+            }
+        })),
+        "vertexai" if model_name.starts_with("claude-fable-5") => Some(serde_json::json!({
+            "body": {
+                "temperature": null,
+                "top_p": null,
+                "output_config": {"effort": effort},
+            }
+        })),
+        "vertexai" => Some(serde_json::json!({
+            "body": {
+                "temperature": null,
+                "top_p": null,
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": effort},
+            }
+        })),
+        "bedrock" => Some(serde_json::json!({
+            "body": {
+                "inferenceConfig": {
+                    "temperature": null,
+                    "topP": null,
+                },
+                "additionalModelRequestFields": {
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": effort},
+                },
+            }
+        })),
+        _ => None,
+    }
+}
+
+fn merge_patch_values(target: &mut Value, source: Value) {
+    match (target, source) {
+        (Value::Object(target), Value::Object(source)) => {
+            for (key, value) in source {
+                match target.get_mut(&key) {
+                    Some(target_value) => merge_patch_values(target_value, value),
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, source) => *target = source,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelData {
     pub name: String,
@@ -307,6 +411,8 @@ pub struct ModelData {
     pub output_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
 
     // chat-only properties
     #[serde(skip_serializing_if = "Option::is_none")]

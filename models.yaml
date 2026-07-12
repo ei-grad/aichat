@@ -3,6 +3,30 @@
 #  - https://platform.openai.com/docs/api-reference/chat
 - provider: openai
   models:
+    - name: gpt-5.6
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_efforts: [none, low, medium, high, xhigh, max]
+    - name: gpt-5.6-terra
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 2.5
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_efforts: [none, low, medium, high, xhigh, max]
+    - name: gpt-5.6-luna
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 1
+      output_price: 6
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_efforts: [none, low, medium, high, xhigh, max]
     - name: gpt-5.2
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -103,6 +127,7 @@
       max_output_tokens: 65536
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high]
     - name: gemini-3.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -110,6 +135,7 @@
       output_price: 0
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [minimal, low, medium, high]
     - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -117,6 +143,7 @@
       output_price: 0
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [minimal, low, medium, high]
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -127,6 +154,7 @@
       max_input_tokens: 1048576
       max_output_tokens: 65536
       supports_vision: true
+      reasoning_efforts: [minimal, low, medium, high]
 
 # Links:
 #  - https://platform.claude.com/docs/en/about-claude/models/overview
@@ -142,6 +170,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -169,6 +198,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, max]
     - name: claude-opus-4-6:thinking
       real_name: claude-opus-4-6
       max_input_tokens: 200000
@@ -193,6 +223,7 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, max]
     - name: claude-sonnet-4-6:thinking
       real_name: claude-sonnet-4-6
       max_input_tokens: 200000
@@ -290,6 +321,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -317,6 +349,7 @@
       input_price: 2
       output_price: 10
       supports_vision: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -329,6 +362,7 @@
       input_price: 10
       output_price: 50
       supports_vision: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -593,6 +627,7 @@
       output_price: 12
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high]
     - name: gemini-3.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -600,6 +635,7 @@
       output_price: 9
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [minimal, low, medium, high]
     - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -607,6 +643,7 @@
       output_price: 1.5
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [minimal, low, medium, high]
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -615,6 +652,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -642,6 +680,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, max]
     - name: claude-opus-4-6:thinking
       real_name: claude-opus-4-6
       max_input_tokens: 200000
@@ -665,6 +704,7 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, max]
     - name: claude-sonnet-4-6:thinking
       real_name: claude-sonnet-4-6
       max_input_tokens: 200000
@@ -770,6 +810,7 @@
       input_price: 0.5
       output_price: 3
       supports_vision: true
+      reasoning_efforts: [minimal, low, medium, high]
     - name: claude-opus-4-8
       type: chat
       max_input_tokens: 1000000
@@ -777,6 +818,7 @@
       require_max_tokens: true
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -800,6 +842,7 @@
       max_output_tokens: 128000
       require_max_tokens: true
       supports_vision: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -810,6 +853,7 @@
       max_output_tokens: 128000
       require_max_tokens: true
       supports_vision: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           temperature: null
@@ -830,6 +874,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, xhigh, max]
       patch:
         body:
           inferenceConfig:
@@ -860,6 +905,7 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, max]
     - name: us.anthropic.claude-opus-4-6-v1:thinking
       real_name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
@@ -885,6 +931,7 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_efforts: [low, medium, high, max]
     - name: us.anthropic.claude-sonnet-4-6:thinking
       real_name: us.anthropic.claude-sonnet-4-6
       max_input_tokens: 200000

@@ -20,6 +20,7 @@ struct ModelRecord {
     input_price: Option<f64>,
     output_price: Option<f64>,
     patch: Option<Value>,
+    reasoning_efforts: Option<Vec<String>>,
     max_output_tokens: Option<isize>,
     require_max_tokens: Option<bool>,
     supports_vision: Option<bool>,
@@ -91,6 +92,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             max_input_tokens: Some(1_048_576),
             max_output_tokens: Some(65_536),
             supports_vision: Some(true),
+            reasoning_efforts: Some(
+                ["minimal", "low", "medium", "high"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             ..chat("gemini-3-flash-preview")
         }
     );
@@ -103,6 +110,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             input_price: Some(5.0),
             output_price: Some(25.0),
             patch: Some(sampling_patch()),
+            reasoning_efforts: Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             max_output_tokens: Some(128_000),
             require_max_tokens: Some(true),
             supports_vision: Some(true),
@@ -134,6 +147,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             max_output_tokens: Some(128_000),
             require_max_tokens: Some(true),
             supports_vision: Some(true),
+            reasoning_efforts: Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             ..chat("claude-sonnet-5")
         }
     );
@@ -147,6 +166,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             max_output_tokens: Some(128_000),
             require_max_tokens: Some(true),
             supports_vision: Some(true),
+            reasoning_efforts: Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             ..chat("claude-fable-5")
         }
     );
@@ -160,6 +185,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             output_price: Some(3.0),
             max_output_tokens: Some(65_536),
             supports_vision: Some(true),
+            reasoning_efforts: Some(
+                ["minimal", "low", "medium", "high"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             ..chat("gemini-3-flash-preview")
         }
     );
@@ -168,6 +199,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
         &ModelRecord {
             max_input_tokens: Some(1_000_000),
             patch: Some(sampling_patch()),
+            reasoning_efforts: Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             max_output_tokens: Some(128_000),
             require_max_tokens: Some(true),
             supports_vision: Some(true),
@@ -192,6 +229,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
         &ModelRecord {
             max_input_tokens: Some(1_000_000),
             patch: Some(sampling_patch()),
+            reasoning_efforts: Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             max_output_tokens: Some(128_000),
             require_max_tokens: Some(true),
             supports_vision: Some(true),
@@ -206,6 +249,12 @@ fn accepted_overlay_records_match_verified_allowlist_exactly() {
             max_output_tokens: Some(128_000),
             require_max_tokens: Some(true),
             supports_vision: Some(true),
+            reasoning_efforts: Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             ..chat("claude-fable-5")
         }
     );
