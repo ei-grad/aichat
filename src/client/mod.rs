@@ -238,6 +238,23 @@ mod catalog_tests {
     }
 
     #[test]
+    fn unsupported_catalog_effort_fails_before_provider_request() {
+        let catalog = catalog();
+        let claude = provider(&catalog, "claude");
+        let expanded = Model::from_config("claude", "claude", &claude.models);
+        let models: Vec<_> = expanded.iter().collect();
+
+        validate_reasoning_effort(&models, "claude", "claude-fable-5:medium")
+            .expect("supported effort must pass");
+        let err = validate_reasoning_effort(&models, "claude", "claude-fable-5:none")
+            .expect_err("unsupported effort must fail locally");
+        assert_eq!(
+            err.to_string(),
+            "Model 'claude:claude-fable-5' does not support reasoning effort 'none'. Supported efforts: low, medium, high, xhigh, max"
+        );
+    }
+
+    #[test]
     fn refreshed_catalog_tracks_gemini_and_minimax_lifecycle() {
         let catalog = catalog();
         let gemini = provider(&catalog, "gemini");

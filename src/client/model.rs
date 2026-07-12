@@ -85,6 +85,7 @@ impl Model {
                         bail!("Model '{model_id}' is not a {model_type} model")
                     }
                 }
+                validate_reasoning_effort(&models, client_name, model_name)?;
                 if list_client_names(config)
                     .into_iter()
                     .any(|v| *v == client_name)
@@ -309,6 +310,37 @@ impl Model {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_reasoning_effort(
+    models: &[&Model],
+    client_name: &str,
+    model_name: &str,
+) -> Result<()> {
+    const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+    let Some((base_name, effort)) = model_name.rsplit_once(':') else {
+        return Ok(());
+    };
+    if !EFFORTS.contains(&effort) {
+        return Ok(());
+    }
+    let base_id = format!("{client_name}:{base_name}");
+    let Some(base) = models.iter().find(|model| model.id() == base_id) else {
+        return Ok(());
+    };
+    let supported = &base.data.reasoning_efforts;
+    if supported.iter().any(|supported| supported == effort) {
+        return Ok(());
+    }
+    let supported = if supported.is_empty() {
+        "none".to_string()
+    } else {
+        supported.join(", ")
+    };
+    bail!(
+        "Model '{base_id}' does not support reasoning effort '{effort}'. Supported efforts: {supported}"
+    )
 }
 
 fn reasoning_effort_patch(client_name: &str, model_name: &str, effort: &str) -> Option<Value> {
