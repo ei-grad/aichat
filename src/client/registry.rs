@@ -148,6 +148,29 @@ pub fn init_client(config: &GlobalConfig, model: Option<Model>) -> Result<Box<dy
     client.ok_or_else(|| anyhow!("Invalid model '{}'", model.id()))
 }
 
+pub(super) fn init_openai_client(config: &GlobalConfig, model: &Model) -> Result<OpenAIClient> {
+    let client_config = config
+        .read()
+        .clients
+        .iter()
+        .find(|client_config| client_config_name(client_config) == Some(model.client_name()))
+        .cloned();
+
+    match client_config {
+        Some(ClientConfig::OpenAIConfig(client_config)) => Ok(OpenAIClient {
+            global_config: config.clone(),
+            config: client_config,
+            model: model.clone(),
+        }),
+        Some(_) => bail!(
+            "OpenAI Responses multi-agent requires a native OpenAI client; model '{}' uses client '{}'",
+            model.id(),
+            model.client_name()
+        ),
+        None => bail!("Invalid model '{}'", model.id()),
+    }
+}
+
 pub fn list_client_types() -> Vec<&'static str> {
     let mut client_types = vec![
         OpenAIClient::NAME,

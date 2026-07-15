@@ -34,6 +34,7 @@ use std::{
         create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
     },
     io::Write,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process,
     sync::{Arc, OnceLock},
@@ -96,6 +97,13 @@ const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_to
 
 static EDITOR: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MultiAgentConfig {
+    pub enabled: bool,
+    pub max_concurrent_subagents: Option<NonZeroUsize>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -117,6 +125,8 @@ pub struct Config {
     pub function_calling: bool,
     pub mapping_tools: IndexMap<String, String>,
     pub use_tools: Option<String>,
+
+    pub multi_agent: MultiAgentConfig,
 
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
@@ -199,6 +209,8 @@ impl Default for Config {
             function_calling: true,
             mapping_tools: Default::default(),
             use_tools: None,
+
+            multi_agent: Default::default(),
 
             repl_prelude: None,
             cmd_prelude: None,
@@ -1086,6 +1098,9 @@ impl Config {
     }
 
     pub fn use_session(&mut self, session_name: Option<&str>) -> Result<()> {
+        if self.multi_agent.enabled {
+            bail!("Responses multi-agent mode does not support sessions");
+        }
         if self.session.is_some() {
             bail!(
                 "Already in a session, please run '.exit session' first to exit the current session."
@@ -1506,6 +1521,9 @@ impl Config {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
+        if session_name.is_some() && config.read().multi_agent.enabled {
+            bail!("Responses multi-agent mode does not support agent sessions");
+        }
         if !config.read().function_calling {
             bail!("Please enable function calling before using the agent.");
         }
@@ -1520,6 +1538,9 @@ impl Config {
                 agent.agent_prelude().map(|v| v.to_string())
             }
         });
+        if session.is_some() && config.read().multi_agent.enabled {
+            bail!("Responses multi-agent mode does not support agent sessions");
+        }
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
         if let Some(session) = session {
@@ -2780,6 +2801,75 @@ mod tests {
 
     fn selected_role(config: &Config) -> Option<&str> {
         config.role.as_ref().map(Role::name)
+    }
+
+    #[test]
+    fn multi_agent_config_preserves_disabled_defaults() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(config.multi_agent, MultiAgentConfig::default());
+        assert!(!config.multi_agent.enabled);
+        assert_eq!(config.multi_agent.max_concurrent_subagents, None);
+    }
+
+    #[test]
+    fn multi_agent_config_deserializes_positive_concurrency_limit() {
+        let config: Config =
+            serde_yaml::from_str("multi_agent:\n  enabled: true\n  max_concurrent_subagents: 6\n")
+                .unwrap();
+
+        assert!(config.multi_agent.enabled);
+        assert_eq!(
+            config
+                .multi_agent
+                .max_concurrent_subagents
+                .map(NonZeroUsize::get),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn multi_agent_config_rejects_zero_concurrency_limit() {
+        let result = serde_yaml::from_str::<Config>(
+            "multi_agent:\n  enabled: true\n  max_concurrent_subagents: 0\n",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_agent_config_rejects_sessions_before_initializing_them() {
+        let mut config = Config::default();
+        config.multi_agent.enabled = true;
+
+        let error = config.use_session(Some("blocked-session")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Responses multi-agent mode does not support sessions"));
+        assert!(config.session.is_none());
+    }
+
+    #[tokio::test]
+    async fn multi_agent_rejects_explicit_agent_session_before_agent_initialization() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.enabled = true;
+
+        let error = Config::use_agent(
+            &config,
+            "missing-agent-that-must-not-be-loaded",
+            Some("blocked-session"),
+            create_abort_signal(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Responses multi-agent mode does not support agent sessions"
+        );
+        assert!(config.read().agent.is_none());
+        assert!(config.read().rag.is_none());
     }
 
     #[test]

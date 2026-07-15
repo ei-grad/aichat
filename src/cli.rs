@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use is_terminal::IsTerminal;
-use std::io::{stdin, Read};
+use std::{
+    io::{stdin, Read},
+    num::NonZeroUsize,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -30,6 +33,12 @@ pub struct Cli {
     /// Set agent variables
     #[clap(long, value_names = ["NAME", "VALUE"], num_args = 2)]
     pub agent_variable: Vec<String>,
+    /// Enable Responses API multi-agent mode
+    #[clap(long)]
+    pub multi_agent: bool,
+    /// Limit the number of concurrent hosted subagents
+    #[clap(long, value_name = "N")]
+    pub max_concurrent_subagents: Option<NonZeroUsize>,
     /// Start a RAG
     #[clap(long)]
     pub rag: Option<String>,
@@ -248,5 +257,34 @@ mod tests {
         let cli = parse(&["aichat", "--show-cost", "hello"]);
         assert!(cli.show_cost);
         assert_eq!(cli.text_with_stdin(""), Some("hello".into()));
+    }
+
+    #[test]
+    fn parses_multi_agent_controls() {
+        let cli = parse(&[
+            "aichat",
+            "--multi-agent",
+            "--max-concurrent-subagents",
+            "4",
+            "delegate",
+        ]);
+        assert!(cli.multi_agent);
+        assert_eq!(cli.max_concurrent_subagents.map(NonZeroUsize::get), Some(4));
+        assert_eq!(cli.text_with_stdin(""), Some("delegate".into()));
+
+        let cli = parse(&["aichat", "--max-concurrent-subagents", "2"]);
+        assert!(!cli.multi_agent);
+        assert_eq!(cli.max_concurrent_subagents.map(NonZeroUsize::get), Some(2));
+
+        let cli = parse(&["aichat", "--multi-agent"]);
+        assert!(cli.multi_agent);
+        assert_eq!(cli.max_concurrent_subagents, None);
+    }
+
+    #[test]
+    fn rejects_zero_max_concurrent_subagents() {
+        let err = Cli::try_parse_from(["aichat", "--max-concurrent-subagents", "0"])
+            .expect_err("zero must be rejected during argument parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 }

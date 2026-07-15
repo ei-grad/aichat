@@ -57,6 +57,7 @@ impl Agent {
         definition.replace_tools_placeholder(&functions);
 
         agent_config.load_envs(&definition.name);
+        validate_multi_agent_session_prelude(&config.read(), &agent_config)?;
 
         let model = {
             let config = config.read();
@@ -430,6 +431,13 @@ impl AgentConfig {
     }
 }
 
+fn validate_multi_agent_session_prelude(config: &Config, agent_config: &AgentConfig) -> Result<()> {
+    if config.multi_agent.enabled && !config.macro_flag && agent_config.agent_prelude.is_some() {
+        bail!("Responses multi-agent mode does not support agent sessions");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AgentDefinition {
     pub name: String,
@@ -556,4 +564,45 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
             (format!("{}=", v.name), Some(description))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_agent_rejects_env_overridden_prelude_before_rag_initialization() {
+        let agent_name = format!("multi-agent-preflight-{}", uuid::Uuid::new_v4());
+        let env_name = normalize_env_name(&format!("{agent_name}_agent_prelude"));
+        env::set_var(&env_name, "blocked-session");
+        let mut agent_config = AgentConfig::default();
+        agent_config.load_envs(&agent_name);
+        env::remove_var(&env_name);
+
+        let mut config = Config::default();
+        config.multi_agent.enabled = true;
+        let error = validate_multi_agent_session_prelude(&config, &agent_config).unwrap_err();
+
+        assert_eq!(
+            agent_config.agent_prelude.as_deref(),
+            Some("blocked-session")
+        );
+        assert_eq!(
+            error.to_string(),
+            "Responses multi-agent mode does not support agent sessions"
+        );
+    }
+
+    #[test]
+    fn multi_agent_ignores_agent_prelude_during_macro_execution() {
+        let mut config = Config::default();
+        config.multi_agent.enabled = true;
+        config.macro_flag = true;
+        let agent_config = AgentConfig {
+            agent_prelude: Some("ignored-session".into()),
+            ..Default::default()
+        };
+
+        validate_multi_agent_session_prelude(&config, &agent_config).unwrap();
+    }
 }

@@ -22,7 +22,25 @@ pub fn eval_tool_calls(config: &GlobalConfig, calls: Vec<ToolCall>) -> Result<Ve
     eval_tool_calls_with(calls, |call| call.eval(config))
 }
 
-fn eval_tool_calls_with<F>(mut calls: Vec<ToolCall>, mut eval: F) -> Result<Vec<ToolResult>>
+pub fn eval_tool_calls_preserving_results(
+    config: &GlobalConfig,
+    calls: Vec<ToolCall>,
+) -> Result<Vec<ToolResult>> {
+    eval_tool_calls_with_options(calls, |call| call.eval(config), false)
+}
+
+fn eval_tool_calls_with<F>(calls: Vec<ToolCall>, eval: F) -> Result<Vec<ToolResult>>
+where
+    F: FnMut(&ToolCall) -> Result<Value>,
+{
+    eval_tool_calls_with_options(calls, eval, true)
+}
+
+fn eval_tool_calls_with_options<F>(
+    mut calls: Vec<ToolCall>,
+    mut eval: F,
+    omit_all_null: bool,
+) -> Result<Vec<ToolResult>>
 where
     F: FnMut(&ToolCall) -> Result<Value>,
 {
@@ -52,7 +70,7 @@ where
         }
         output.push(ToolResult::new(call, result));
     }
-    if is_all_null {
+    if omit_all_null && is_all_null {
         output = vec![];
     }
     Ok(output)
@@ -395,6 +413,22 @@ mod tests {
         assert!(eval_tool_calls_with(calls, |_| Ok(Value::Null))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn preserving_results_keeps_one_output_per_null_call() {
+        let calls = vec![
+            ToolCall::new("null".into(), json!({}), Some("call-1".into())),
+            ToolCall::new("null".into(), json!({}), Some("call-2".into())),
+        ];
+
+        let results = eval_tool_calls_with_options(calls, |_| Ok(Value::Null), false).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].call.id.as_deref(), Some("call-1"));
+        assert_eq!(results[0].output, json!("DONE"));
+        assert_eq!(results[1].call.id.as_deref(), Some("call-2"));
+        assert_eq!(results[1].output, json!("DONE"));
     }
 
     #[test]

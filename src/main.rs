@@ -15,7 +15,7 @@ extern crate log;
 use crate::cli::Cli;
 use crate::client::{
     call_chat_completions, call_chat_completions_streaming, format_usage_cost, list_models,
-    ModelType, TokenUsage,
+    openai_responses::run_openai_responses_multi_agent, ModelType, TokenUsage,
 };
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
@@ -65,6 +65,8 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     let abort_signal = create_abort_signal();
     let files = cli.files();
 
+    configure_multi_agent(&config, &cli)?;
+
     if cli.sync_models {
         let url = config.read().sync_models_url();
         return Config::sync_models(&url, abort_signal.clone()).await;
@@ -97,6 +99,8 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
 
+    validate_multi_agent_mode(&config, &cli)?;
+
     if cli.dry_run {
         config.write().dry_run = true;
     }
@@ -121,6 +125,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
         config.write().agent_variables = None;
         ret?;
+        if config.read().multi_agent.enabled && config.read().session.is_some() {
+            bail!("Responses multi-agent mode does not support agent preludes that open a session");
+        }
     } else {
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
@@ -183,6 +190,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     config.write().apply_prelude()?;
+    if config.read().multi_agent.enabled && config.read().session.is_some() {
+        bail!("Responses multi-agent mode does not support sessions opened by command preludes");
+    }
     match is_repl {
         false => {
             let mut input = create_input(&config, text, &files, abort_signal.clone()).await?;
@@ -196,6 +206,50 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             start_interactive(&config).await
         }
     }
+}
+
+fn configure_multi_agent(config: &GlobalConfig, cli: &Cli) -> Result<()> {
+    let enabled = cli.multi_agent || config.read().multi_agent.enabled;
+    if cli.max_concurrent_subagents.is_some() && !enabled {
+        bail!(
+            "--max-concurrent-subagents requires multi-agent mode; enable it with --multi-agent or multi_agent.enabled"
+        );
+    }
+
+    let mut config = config.write();
+    config.multi_agent.enabled = enabled;
+    if let Some(max_concurrent_subagents) = cli.max_concurrent_subagents {
+        config.multi_agent.max_concurrent_subagents = Some(max_concurrent_subagents);
+    }
+    Ok(())
+}
+
+fn validate_multi_agent_mode(config: &GlobalConfig, cli: &Cli) -> Result<()> {
+    if !config.read().multi_agent.enabled {
+        return Ok(());
+    }
+    if cli.serve.is_some() {
+        bail!("Responses multi-agent mode does not support --serve");
+    }
+    if cli.execute {
+        bail!("Responses multi-agent mode does not support --execute");
+    }
+    if cli.macro_name.is_some() {
+        bail!("Responses multi-agent mode does not support macros");
+    }
+    if cli.session.is_some() {
+        bail!("Responses multi-agent mode does not support named or temporary sessions");
+    }
+    if cli.empty_session || cli.save_session {
+        bail!("Responses multi-agent mode does not support session management options");
+    }
+    if cli.info || cli.list_sessions || cli.rebuild_rag {
+        return Ok(());
+    }
+    if config.read().working_mode.is_repl() {
+        bail!("Responses multi-agent mode supports one-shot command input only; REPL is not supported");
+    }
+    Ok(())
 }
 
 #[async_recursion::async_recursion]
@@ -221,6 +275,10 @@ async fn run_directive(
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<TokenUsage> {
+    if config.read().multi_agent.enabled {
+        return run_multi_agent_directive(config, input, code_mode, abort_signal).await;
+    }
+
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
@@ -253,6 +311,38 @@ async fn run_directive(
         usage.add(next_usage);
     }
     Ok(usage)
+}
+
+async fn run_multi_agent_directive(
+    config: &GlobalConfig,
+    input: Input,
+    code_mode: bool,
+    abort_signal: AbortSignal,
+) -> Result<TokenUsage> {
+    let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
+    let max_concurrent_subagents = config.read().multi_agent.max_concurrent_subagents;
+    config.write().before_chat_completion(&input)?;
+    let mut output = abortable_run_with_spinner(
+        run_openai_responses_multi_agent(
+            config,
+            &input,
+            max_concurrent_subagents,
+            abort_signal.clone(),
+        ),
+        "Generating",
+        abort_signal,
+    )
+    .await?;
+    if extract_code {
+        output.text = extract_code_block(&strip_think_tag(&output.text)).to_string();
+    }
+    if !output.text.is_empty() {
+        config.read().print_markdown(&output.text)?;
+    }
+    config
+        .write()
+        .after_chat_completion(&input, &output.text, &[])?;
+    Ok(output.usage())
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
@@ -439,5 +529,163 @@ mod tests {
         run(config.clone(), cli, None).await.unwrap();
 
         assert!(config.read().state().is_empty());
+    }
+
+    #[test]
+    fn cli_enables_multi_agent_and_sets_concurrency_limit() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let cli = Cli::try_parse_from([
+            "aichat",
+            "--multi-agent",
+            "--max-concurrent-subagents",
+            "4",
+            "prompt",
+        ])
+        .unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+
+        let config = config.read();
+        assert!(config.multi_agent.enabled);
+        assert_eq!(
+            config
+                .multi_agent
+                .max_concurrent_subagents
+                .map(|value| value.get()),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn cli_concurrency_limit_overrides_enabled_config() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.enabled = true;
+        let cli =
+            Cli::try_parse_from(["aichat", "--max-concurrent-subagents", "6", "prompt"]).unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+
+        assert_eq!(
+            config
+                .read()
+                .multi_agent
+                .max_concurrent_subagents
+                .map(|value| value.get()),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn concurrency_limit_requires_multi_agent_mode() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let cli =
+            Cli::try_parse_from(["aichat", "--max-concurrent-subagents", "2", "prompt"]).unwrap();
+
+        let error = configure_multi_agent(&config, &cli).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("--max-concurrent-subagents requires multi-agent mode"));
+    }
+
+    #[test]
+    fn multi_agent_accepts_one_shot_command_mode() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.enabled = true;
+        let cli = Cli::try_parse_from(["aichat", "prompt"]).unwrap();
+
+        validate_multi_agent_mode(&config, &cli).unwrap();
+    }
+
+    #[test]
+    fn disabled_multi_agent_does_not_restrict_existing_modes() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let cli = Cli::try_parse_from(["aichat", "--execute", "prompt"]).unwrap();
+
+        validate_multi_agent_mode(&config, &cli).unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_agent_allows_non_generation_info_commands_in_repl_mode() {
+        for flag in ["--info", "--list-sessions"] {
+            let config = Arc::new(RwLock::new(Config::default()));
+            {
+                let mut config = config.write();
+                config.multi_agent.enabled = true;
+                config.working_mode = WorkingMode::Repl;
+            }
+            let cli = Cli::try_parse_from(["aichat", flag]).unwrap();
+
+            run(config.clone(), cli, None).await.unwrap();
+
+            assert!(config.read().multi_agent.enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_agent_rebuild_rag_reaches_maintenance_path_in_repl_mode() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        {
+            let mut config = config.write();
+            config.multi_agent.enabled = true;
+            config.working_mode = WorkingMode::Repl;
+        }
+        let cli = Cli::try_parse_from(["aichat", "--rebuild-rag"]).unwrap();
+
+        let error = run(config.clone(), cli, None).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "No RAG");
+        assert!(config.read().multi_agent.enabled);
+    }
+
+    #[test]
+    fn multi_agent_info_commands_still_reject_sessions() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.enabled = true;
+
+        for flag in ["--info", "--list-sessions", "--rebuild-rag"] {
+            let cli = Cli::try_parse_from(["aichat", flag, "--session", "saved"]).unwrap();
+            assert!(validate_multi_agent_mode(&config, &cli)
+                .unwrap_err()
+                .to_string()
+                .contains("sessions"));
+        }
+    }
+
+    #[test]
+    fn multi_agent_rejects_incompatible_modes() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.enabled = true;
+
+        let serve = Cli::try_parse_from(["aichat", "--serve"]).unwrap();
+        assert!(validate_multi_agent_mode(&config, &serve)
+            .unwrap_err()
+            .to_string()
+            .contains("--serve"));
+
+        let execute = Cli::try_parse_from(["aichat", "--execute", "prompt"]).unwrap();
+        assert!(validate_multi_agent_mode(&config, &execute)
+            .unwrap_err()
+            .to_string()
+            .contains("--execute"));
+
+        let macro_cli = Cli::try_parse_from(["aichat", "--macro", "example"]).unwrap();
+        assert!(validate_multi_agent_mode(&config, &macro_cli)
+            .unwrap_err()
+            .to_string()
+            .contains("macros"));
+
+        let session = Cli::try_parse_from(["aichat", "--session", "saved", "prompt"]).unwrap();
+        assert!(validate_multi_agent_mode(&config, &session)
+            .unwrap_err()
+            .to_string()
+            .contains("sessions"));
+
+        config.write().working_mode = WorkingMode::Repl;
+        let repl = Cli::try_parse_from(["aichat"]).unwrap();
+        assert!(validate_multi_agent_mode(&config, &repl)
+            .unwrap_err()
+            .to_string()
+            .contains("REPL"));
     }
 }

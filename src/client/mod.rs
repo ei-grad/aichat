@@ -13,6 +13,7 @@ mod message;
 mod model;
 mod openai;
 mod openai_compatible;
+pub mod openai_responses;
 mod registry;
 mod retry;
 mod stream;
@@ -84,21 +85,43 @@ mod catalog_tests {
 
         for (name, input_price, output_price) in [
             ("gpt-5.6", 5.0, 30.0),
+            ("gpt-5.6-sol", 5.0, 30.0),
             ("gpt-5.6-terra", 2.5, 15.0),
             ("gpt-5.6-luna", 1.0, 6.0),
         ] {
-            let base = model(openai, name);
-            assert_eq!(base.max_input_tokens, Some(1_050_000));
-            assert_eq!(base.max_output_tokens, Some(128_000));
-            assert_eq!(base.input_price, Some(input_price));
-            assert_eq!(base.output_price, Some(output_price));
+            let catalog_model = model(openai, name);
+            assert_eq!(catalog_model.max_input_tokens, Some(1_050_000));
+            assert_eq!(catalog_model.max_output_tokens, Some(128_000));
+            assert_eq!(catalog_model.input_price, Some(input_price));
+            assert_eq!(catalog_model.output_price, Some(output_price));
+            assert!(catalog_model.supports_vision);
+            assert!(catalog_model.supports_function_calling);
+            assert_eq!(
+                catalog_model.reasoning_efforts,
+                ["none", "low", "medium", "high", "xhigh", "max"]
+            );
+
+            let listed: Vec<_> = expanded
+                .iter()
+                .filter(|model| model.real_name() == name)
+                .collect();
+            assert_eq!(listed.len(), 7, "unexpected variants for openai:{name}");
+
+            let base = listed
+                .iter()
+                .find(|model| model.name() == name)
+                .unwrap_or_else(|| panic!("missing openai:{name}"));
+            assert_eq!(base.real_name(), name);
+            assert_eq!(base.reasoning_effort(), None);
+            assert!(base.data().patch.is_none());
 
             for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
-                let variant = expanded
+                let variant = listed
                     .iter()
                     .find(|model| model.name() == format!("{name}:{effort}"))
                     .unwrap_or_else(|| panic!("missing openai:{name}:{effort}"));
                 assert_eq!(variant.real_name(), name);
+                assert_eq!(variant.reasoning_effort(), Some(effort));
                 let body = patched_body(variant.data(), json!({"temperature": 0.4, "top_p": 0.8}));
                 assert_eq!(body["reasoning_effort"], effort);
                 assert!(body.get("temperature").is_none());

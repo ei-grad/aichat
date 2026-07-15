@@ -11,6 +11,14 @@
       supports_vision: true
       supports_function_calling: true
       reasoning_efforts: [none, low, medium, high, xhigh, max]
+    - name: gpt-5.6-sol
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_efforts: [none, low, medium, high, xhigh, max]
     - name: gpt-5.6-terra
       max_input_tokens: 1050000
       max_output_tokens: 128000

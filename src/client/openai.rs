@@ -27,6 +27,24 @@ impl OpenAIClient {
     config_get_fn!(api_base, get_api_base);
 
     pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None)];
+
+    pub(super) fn prepare_responses_request(&self, body: Value) -> Result<RequestData> {
+        let api_key = self.get_api_key()?;
+        let api_base =
+            optional_config_field(self.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
+        let mut request_data = RequestData::new(
+            format!("{}/responses", api_base.trim_end_matches('/')),
+            body,
+        );
+
+        request_data.bearer_auth(api_key);
+        request_data.header("OpenAI-Beta", "responses_multi_agent=v1");
+        if let Some(organization_id) = &self.config.organization_id {
+            request_data.header("OpenAI-Organization", organization_id);
+        }
+
+        Ok(request_data)
+    }
 }
 
 impl_client_trait!(

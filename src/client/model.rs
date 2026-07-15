@@ -19,6 +19,7 @@ const BASIS_TOKENS: usize = 2;
 pub struct Model {
     client_name: String,
     data: ModelData,
+    reasoning_effort: Option<String>,
 }
 
 impl Default for Model {
@@ -32,6 +33,7 @@ impl Model {
         Self {
             client_name: client_name.into(),
             data: ModelData::new(name),
+            reasoning_effort: None,
         }
     }
 
@@ -42,6 +44,7 @@ impl Model {
                 let base = Model {
                     client_name: client_name.to_string(),
                     data: data.clone(),
+                    reasoning_effort: None,
                 };
                 let variants = data.reasoning_efforts.iter().filter_map(|effort| {
                     let real_name = data.real_name.as_deref().unwrap_or(&data.name);
@@ -57,6 +60,7 @@ impl Model {
                     Some(Model {
                         client_name: client_name.to_string(),
                         data: variant,
+                        reasoning_effort: Some(effort.clone()),
                     })
                 });
                 std::iter::once(base).chain(variants).collect::<Vec<_>>()
@@ -126,6 +130,10 @@ impl Model {
 
     pub fn real_name(&self) -> &str {
         self.data.real_name.as_deref().unwrap_or(&self.data.name)
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
     }
 
     pub fn model_type(&self) -> ModelType {
