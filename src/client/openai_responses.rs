@@ -23,6 +23,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 const ROOT_AGENT: &str = "/root";
 const MULTI_AGENT_INSTRUCTIONS: &str = "Proactive multi-agent delegation is active. Use subagents when parallel work would materially improve speed or quality.";
@@ -69,7 +71,7 @@ pub async fn run_openai_responses_multi_agent(
     let mut output = run_multi_agent_loop_with_progress(
         body,
         &abort_signal,
-        |body| send_openai_responses_turn(&client, &http, body),
+        |body| send_openai_responses_turn(&client, &http, body, progress.clone()),
         |calls| execute_function_calls(config, calls),
         Some(&progress),
     )
@@ -479,9 +481,12 @@ async fn send_openai_responses_turn(
     client: &super::OpenAIClient,
     http: &ReqwestClient,
     body: Value,
+    progress: OpenAIResponsesProgress,
 ) -> Result<Value> {
+    progress.begin_live_turn();
     retry_request(|| {
         let request = prepare_openai_responses_request(client, body.clone());
+        let progress = progress.clone();
         async move {
             let request = request?;
             let client_request_id = request
@@ -489,26 +494,97 @@ async fn send_openai_responses_turn(
                 .get("x-client-request-id")
                 .context("OpenAI Responses request is missing x-client-request-id")?
                 .clone();
-            send_openai_responses_request(request.into_builder(http), &client_request_id).await
+            let log_body = openai_responses_request_log_body(&request.body);
+            send_openai_responses_request_with_progress(
+                request.into_builder_with_log_body(http, log_body),
+                &client_request_id,
+                Some(&progress),
+            )
+            .await
         }
     })
     .await
     .context("Failed to call OpenAI Responses api")
 }
 
+fn openai_responses_request_log_body(body: &Value) -> Value {
+    let tool_types = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+                .map(|value| Value::String(sanitize_display(value, 64)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let input_items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    json!({
+        "model": body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(|value| sanitize_display(value, 120)),
+        "stream": body.get("stream").and_then(Value::as_bool),
+        "input_items": input_items,
+        "instructions_present": body.get("instructions").is_some(),
+        "store": body.get("store").and_then(Value::as_bool),
+        "service_tier": body
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(|value| sanitize_display(value, 32)),
+        "multi_agent_enabled": body
+            .pointer("/multi_agent/enabled")
+            .and_then(Value::as_bool),
+        "tool_types": tool_types,
+        "tool_choice": body
+            .get("tool_choice")
+            .and_then(Value::as_str)
+            .map(|value| sanitize_display(value, 32)),
+        "reasoning_effort": body
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str)
+            .map(|value| sanitize_display(value, 32)),
+        "max_output_tokens": body.get("max_output_tokens").and_then(Value::as_u64),
+    })
+}
+
+#[cfg(test)]
 async fn send_openai_responses_request(
     builder: RequestBuilder,
     client_request_id: &str,
+) -> Result<Value> {
+    send_openai_responses_request_with_progress(builder, client_request_id, None).await
+}
+
+async fn send_openai_responses_request_with_progress(
+    builder: RequestBuilder,
+    client_request_id: &str,
+    progress: Option<&OpenAIResponsesProgress>,
 ) -> Result<Value> {
     let mut stream = builder.eventsource()?;
     stream.set_retry_policy(Box::new(Never));
     let mut opened = false;
     let mut response_id = None;
     let mut last_sequence_number = None;
+    let mut live_state = OpenAIResponsesLiveStreamState::default();
 
     while let Some(event) = stream.next().await {
         match event {
-            Ok(Event::Open) => opened = true,
+            Ok(Event::Open) => {
+                opened = true;
+                if let Some(progress) = progress {
+                    progress.record_stream_open();
+                }
+                debug!(
+                    "OpenAI Responses SSE stream opened (x-client-request-id: {})",
+                    sanitize_display(client_request_id, 128)
+                );
+            }
             Ok(Event::Message(message)) => {
                 opened = true;
                 let data: Value = serde_json::from_str(&message.data).with_context(|| {
@@ -542,6 +618,25 @@ async fn send_openai_responses_request(
                         )
                     )
                 })?;
+                if matches!(
+                    event_type,
+                    "response.completed" | "response.failed" | "response.incomplete"
+                ) {
+                    emit_terminal_response_trace(
+                        &data,
+                        response_id.as_deref(),
+                        progress,
+                        &mut live_state,
+                    );
+                }
+                observe_openai_responses_stream_event(
+                    &data,
+                    event_type,
+                    response_id.as_deref(),
+                    last_sequence_number,
+                    &mut live_state,
+                    progress,
+                );
                 match event_type {
                     "response.completed" | "response.failed" | "response.incomplete" => {
                         let response = data.get("response").cloned().ok_or_else(|| {
@@ -556,7 +651,6 @@ async fn send_openai_responses_request(
                             )
                         })?;
                         stream.close();
-                        debug!("openai-responses-data: {response}");
                         return Ok(response);
                     }
                     "error" => {
@@ -603,6 +697,280 @@ async fn send_openai_responses_request(
             client_request_id
         )
     )
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenAIResponsesLiveOutputContext {
+    item_type: Option<String>,
+    agent_name: Option<String>,
+    action: Option<String>,
+}
+
+#[derive(Default)]
+struct OpenAIResponsesLiveStreamState {
+    output_contexts: HashMap<u64, OpenAIResponsesLiveOutputContext>,
+    hosted_calls: HashMap<String, HostedCallContext>,
+    emitted_trace_output_indexes: HashSet<u64>,
+    emitted_trace_item_ids: HashSet<String>,
+}
+
+impl OpenAIResponsesLiveStreamState {
+    fn mark_trace_item(&mut self, output_index: Option<u64>, item: &Value) -> bool {
+        let item_id = item.get("id").and_then(Value::as_str);
+        if output_index.is_some_and(|index| self.emitted_trace_output_indexes.contains(&index))
+            || item_id.is_some_and(|item_id| self.emitted_trace_item_ids.contains(item_id))
+        {
+            return false;
+        }
+        if let Some(output_index) = output_index {
+            self.emitted_trace_output_indexes.insert(output_index);
+        }
+        if let Some(item_id) = item_id {
+            self.emitted_trace_item_ids.insert(item_id.to_string());
+        }
+        true
+    }
+}
+
+fn observe_openai_responses_stream_event(
+    data: &Value,
+    event_type: &str,
+    response_id: Option<&str>,
+    sequence_number: Option<u64>,
+    live_state: &mut OpenAIResponsesLiveStreamState,
+    progress: Option<&OpenAIResponsesProgress>,
+) {
+    let output_index = data.get("output_index").and_then(Value::as_u64);
+    let item = data.get("item");
+    if let (Some(output_index), Some(item)) = (output_index, item) {
+        let context = live_state.output_contexts.entry(output_index).or_default();
+        if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+            context.item_type = Some(sanitize_display(item_type, 64));
+        }
+        if let Some(agent_name) = stream_agent_name(data).or_else(|| trace_agent_name(item)) {
+            context.agent_name = Some(sanitize_display(&agent_name, 120));
+        }
+        if let Some(action) = item.get("action").and_then(Value::as_str) {
+            context.action = Some(sanitize_display(action, 64));
+        }
+    }
+
+    let context = output_index.and_then(|index| live_state.output_contexts.get(&index));
+    let item_type = item
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .map(|value| sanitize_display(value, 64))
+        .or_else(|| context.and_then(|context| context.item_type.clone()));
+    let agent_name = stream_agent_name(data)
+        .or_else(|| item.and_then(trace_agent_name))
+        .map(|value| sanitize_display(&value, 120))
+        .or_else(|| context.and_then(|context| context.agent_name.clone()));
+    let action = item
+        .and_then(|item| item.get("action"))
+        .and_then(Value::as_str)
+        .map(|value| sanitize_display(value, 64))
+        .or_else(|| context.and_then(|context| context.action.clone()));
+
+    debug!(
+        "OpenAI Responses SSE event type={} sequence={} response={} output_index={} item_type={} agent={} action={}",
+        sanitize_display(event_type, 80),
+        display_live_number(sequence_number),
+        display_live_value(response_id, 128),
+        display_live_number(output_index),
+        display_live_option(item_type.as_deref(), 64),
+        display_live_option(agent_name.as_deref(), 120),
+        display_live_option(action.as_deref(), 64),
+    );
+
+    let Some(progress) = progress else {
+        return;
+    };
+    let status = OpenAIResponsesLiveStatusUpdate {
+        response_id: response_id.map(|value| sanitize_display(value, 128)),
+        event_type: sanitize_display(event_type, 80),
+        sequence_number,
+        output_index,
+        item_type,
+        agent_name,
+        action,
+    };
+    let trace = live_trace_event(data, event_type, &status, live_state);
+    progress.observe_live_event(status, trace);
+}
+
+fn stream_agent_name(data: &Value) -> Option<String> {
+    data.get("agent")
+        .and_then(|agent| agent.get("agent_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn live_trace_event(
+    data: &Value,
+    event_type: &str,
+    status: &OpenAIResponsesLiveStatusUpdate,
+    live_state: &mut OpenAIResponsesLiveStreamState,
+) -> Option<OpenAIResponsesLiveTraceEvent> {
+    let response_id = status.response_id.as_deref().unwrap_or("unavailable");
+    match event_type {
+        "response.created" => Some(OpenAIResponsesLiveTraceEvent {
+            line: format!(
+                "response={} status=created",
+                sanitize_display(response_id, 128)
+            ),
+        }),
+        "response.completed" | "response.failed" | "response.incomplete" => {
+            let status = event_type.strip_prefix("response.").unwrap_or(event_type);
+            Some(OpenAIResponsesLiveTraceEvent {
+                line: format!(
+                    "response={} status={}",
+                    sanitize_display(response_id, 128),
+                    sanitize_display(status, 32)
+                ),
+            })
+        }
+        "error" => Some(OpenAIResponsesLiveTraceEvent {
+            line: format!(
+                "response={} status=error",
+                sanitize_display(response_id, 128)
+            ),
+        }),
+        "response.output_item.added" => {
+            let item_type = status.item_type.as_deref()?;
+            if !is_live_structural_item(item_type) {
+                return None;
+            }
+            Some(OpenAIResponsesLiveTraceEvent {
+                line: format!(
+                    "response={} item={} agent={} action={} status=started",
+                    sanitize_display(response_id, 128),
+                    sanitize_display(item_type, 64),
+                    display_live_option(status.agent_name.as_deref(), 120),
+                    display_live_option(status.action.as_deref(), 64)
+                ),
+            })
+        }
+        "response.output_item.done" => {
+            let raw_item = data.get("item")?;
+            let item = live_trace_item_with_context(raw_item, status);
+            let trace = trace_event(&item, &live_state.hosted_calls)?;
+            if let OpenAIResponsesTraceEvent::MultiAgentCall {
+                call_id: Some(call_id),
+                action,
+                agent_name,
+                ..
+            } = &trace
+            {
+                live_state.hosted_calls.insert(
+                    call_id.clone(),
+                    HostedCallContext {
+                        action: action.clone(),
+                        agent_name: agent_name.clone(),
+                    },
+                );
+            }
+            let mut detail = String::new();
+            format_trace_event(&mut detail, &trace);
+            let line = format_live_structural_trace_line(response_id, detail.trim_start());
+            live_state
+                .mark_trace_item(status.output_index, raw_item)
+                .then_some(OpenAIResponsesLiveTraceEvent { line })
+        }
+        _ if event_type.starts_with("response.web_search_call.") => {
+            let web_status = event_type
+                .strip_prefix("response.web_search_call.")
+                .unwrap_or("unknown");
+            Some(OpenAIResponsesLiveTraceEvent {
+                line: format!(
+                    "response={} web_search agent={} status={}",
+                    sanitize_display(response_id, 128),
+                    display_live_option(status.agent_name.as_deref(), 120),
+                    sanitize_display(web_status, 32)
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn live_trace_item_with_context(
+    raw_item: &Value,
+    status: &OpenAIResponsesLiveStatusUpdate,
+) -> Value {
+    let mut item = raw_item.clone();
+    let Some(item_object) = item.as_object_mut() else {
+        return item;
+    };
+    if trace_agent_name(raw_item).is_none() {
+        if let Some(agent_name) = &status.agent_name {
+            item_object.insert("agent".to_string(), json!({"agent_name": agent_name}));
+        }
+    }
+    if raw_item.get("action").and_then(Value::as_str).is_none() {
+        if let Some(action) = &status.action {
+            item_object.insert("action".to_string(), Value::String(action.clone()));
+        }
+    }
+    item
+}
+
+fn emit_terminal_response_trace(
+    data: &Value,
+    response_id: Option<&str>,
+    progress: Option<&OpenAIResponsesProgress>,
+    live_state: &mut OpenAIResponsesLiveStreamState,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    let Some(output) = data.pointer("/response/output").and_then(Value::as_array) else {
+        return;
+    };
+    let response_id = response_id.unwrap_or("unavailable");
+    let hosted_calls = hosted_call_contexts(output);
+    for (output_index, item) in output.iter().enumerate() {
+        let Some(trace) = trace_event(item, &hosted_calls) else {
+            continue;
+        };
+        if !live_state.mark_trace_item(u64::try_from(output_index).ok(), item) {
+            continue;
+        }
+        let mut detail = String::new();
+        format_trace_event(&mut detail, &trace);
+        let line = format_live_structural_trace_line(response_id, detail.trim_start());
+        progress.emit_live_trace(OpenAIResponsesLiveTraceEvent { line });
+    }
+}
+
+fn format_live_structural_trace_line(response_id: &str, detail: &str) -> String {
+    format!(
+        "response={} status=completed {}",
+        sanitize_display(response_id, 128),
+        detail
+    )
+}
+
+fn is_live_structural_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "multi_agent_call" | "multi_agent_call_output" | "agent_message" | "function_call"
+    ) || item_type.ends_with("_call")
+}
+
+fn display_live_value(value: Option<&str>, max_chars: usize) -> String {
+    display_live_option(value, max_chars)
+}
+
+fn display_live_option(value: Option<&str>, max_chars: usize) -> String {
+    value
+        .map(|value| sanitize_display(value, max_chars))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn display_live_number(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
 }
 
 fn responses_stream_position(
@@ -762,15 +1130,89 @@ pub struct OpenAIResponsesProgress {
 struct OpenAIResponsesProgressState {
     turns: Vec<OpenAIResponsesTurn>,
     pricing_context: Option<OpenAIResponsesPricingContext>,
+    live_status: OpenAIResponsesLiveStatus,
+    live_trace_sender: Option<UnboundedSender<OpenAIResponsesLiveTraceEvent>>,
 }
 
 impl OpenAIResponsesProgress {
+    pub fn live() -> (Self, UnboundedReceiver<OpenAIResponsesLiveTraceEvent>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let progress = Self::default();
+        {
+            let mut state = progress.state.lock();
+            state.live_status.started_at = Some(std::time::Instant::now());
+            state.live_trace_sender = Some(sender);
+        }
+        (progress, receiver)
+    }
+
     fn set_pricing_context(&self, pricing_context: OpenAIResponsesPricingContext) {
         self.state.lock().pricing_context = Some(pricing_context);
     }
 
     fn push_turn(&self, turn: OpenAIResponsesTurn) {
         self.state.lock().turns.push(turn);
+    }
+
+    fn begin_live_turn(&self) {
+        let mut state = self.state.lock();
+        state.live_status.response_id = None;
+        state.live_status.event_type = Some("connecting".to_string());
+        state.live_status.sequence_number = None;
+        state.live_status.output_index = None;
+        state.live_status.item_type = None;
+        state.live_status.agent_name = None;
+        state.live_status.action = None;
+        state.live_status.last_event_at = Some(std::time::Instant::now());
+    }
+
+    fn record_stream_open(&self) {
+        let mut state = self.state.lock();
+        state.live_status.event_type = Some("stream.open".to_string());
+        state.live_status.last_event_at = Some(std::time::Instant::now());
+    }
+
+    fn observe_live_event(
+        &self,
+        status: OpenAIResponsesLiveStatusUpdate,
+        trace: Option<OpenAIResponsesLiveTraceEvent>,
+    ) {
+        {
+            let mut state = self.state.lock();
+            state.live_status.response_id = status.response_id;
+            state.live_status.event_type = Some(status.event_type);
+            state.live_status.sequence_number = status.sequence_number;
+            state.live_status.output_index = status.output_index;
+            state.live_status.item_type = status.item_type;
+            state.live_status.agent_name = status.agent_name;
+            state.live_status.action = status.action;
+            state.live_status.last_event_at = Some(std::time::Instant::now());
+        }
+        if let Some(trace) = trace {
+            self.emit_live_trace(trace);
+        }
+    }
+
+    fn emit_live_trace(&self, trace: OpenAIResponsesLiveTraceEvent) {
+        let sender = self.state.lock().live_trace_sender.clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(trace);
+        }
+    }
+
+    pub fn live_snapshot(&self) -> OpenAIResponsesLiveSnapshot {
+        let state = self.state.lock();
+        OpenAIResponsesLiveSnapshot {
+            started_at: state.live_status.started_at,
+            last_event_at: state.live_status.last_event_at,
+            response_id: state.live_status.response_id.clone(),
+            event_type: state.live_status.event_type.clone(),
+            sequence_number: state.live_status.sequence_number,
+            output_index: state.live_status.output_index,
+            item_type: state.live_status.item_type.clone(),
+            agent_name: state.live_status.agent_name.clone(),
+            action: state.live_status.action.clone(),
+        }
     }
 
     pub fn snapshot(&self) -> (Vec<OpenAIResponsesTurn>, OpenAIResponsesPricingContext) {
@@ -782,6 +1224,99 @@ impl OpenAIResponsesProgress {
                 .unwrap_or(OpenAIResponsesPricingContext::UnknownApiBase),
         )
     }
+}
+
+#[derive(Debug, Default)]
+struct OpenAIResponsesLiveStatus {
+    started_at: Option<std::time::Instant>,
+    last_event_at: Option<std::time::Instant>,
+    response_id: Option<String>,
+    event_type: Option<String>,
+    sequence_number: Option<u64>,
+    output_index: Option<u64>,
+    item_type: Option<String>,
+    agent_name: Option<String>,
+    action: Option<String>,
+}
+
+#[derive(Debug)]
+struct OpenAIResponsesLiveStatusUpdate {
+    response_id: Option<String>,
+    event_type: String,
+    sequence_number: Option<u64>,
+    output_index: Option<u64>,
+    item_type: Option<String>,
+    agent_name: Option<String>,
+    action: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAIResponsesLiveSnapshot {
+    started_at: Option<std::time::Instant>,
+    last_event_at: Option<std::time::Instant>,
+    response_id: Option<String>,
+    event_type: Option<String>,
+    sequence_number: Option<u64>,
+    output_index: Option<u64>,
+    item_type: Option<String>,
+    agent_name: Option<String>,
+    action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAIResponsesLiveTraceEvent {
+    line: String,
+}
+
+impl OpenAIResponsesLiveTraceEvent {
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+}
+
+pub fn format_openai_responses_live_progress(
+    snapshot: &OpenAIResponsesLiveSnapshot,
+    now: std::time::Instant,
+) -> String {
+    let elapsed = snapshot
+        .started_at
+        .map(|started_at| now.saturating_duration_since(started_at))
+        .unwrap_or_default();
+    let idle = snapshot
+        .last_event_at
+        .map(|last_event_at| now.saturating_duration_since(last_event_at))
+        .unwrap_or(elapsed);
+    let mut output = format!("Generating {}", format_elapsed(elapsed));
+    if let Some(event_type) = &snapshot.event_type {
+        let _ = write!(output, " | last={}", sanitize_display(event_type, 80));
+    }
+    if let Some(response_id) = &snapshot.response_id {
+        let _ = write!(output, " | response={}", sanitize_display(response_id, 48));
+    }
+    if let Some(agent_name) = &snapshot.agent_name {
+        let _ = write!(output, " | agent={}", sanitize_display(agent_name, 80));
+    }
+    if let Some(item_type) = &snapshot.item_type {
+        let _ = write!(output, " | item={}", sanitize_display(item_type, 64));
+    }
+    if let Some(action) = &snapshot.action {
+        let _ = write!(output, " | action={}", sanitize_display(action, 64));
+    }
+    if let Some(output_index) = snapshot.output_index {
+        let _ = write!(output, " | output={output_index}");
+    }
+    if let Some(sequence_number) = snapshot.sequence_number {
+        let _ = write!(output, " | seq={sequence_number}");
+    }
+    if idle >= Duration::from_secs(2) {
+        let _ = write!(output, " | idle={}s", idle.as_secs());
+    }
+    output
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 #[derive(Debug, Clone)]
@@ -1172,7 +1707,16 @@ struct HostedCallContext {
 }
 
 fn extract_trace(output: &[Value]) -> Vec<OpenAIResponsesTraceEvent> {
-    let calls_by_id = output
+    let calls_by_id = hosted_call_contexts(output);
+
+    output
+        .iter()
+        .filter_map(|item| trace_event(item, &calls_by_id))
+        .collect()
+}
+
+fn hosted_call_contexts(output: &[Value]) -> HashMap<String, HostedCallContext> {
+    output
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("multi_agent_call"))
         .filter_map(|item| {
@@ -1190,11 +1734,6 @@ fn extract_trace(output: &[Value]) -> Vec<OpenAIResponsesTraceEvent> {
                 },
             ))
         })
-        .collect::<HashMap<_, _>>();
-
-    output
-        .iter()
-        .filter_map(|item| trace_event(item, &calls_by_id))
         .collect()
 }
 
@@ -1959,6 +2498,7 @@ fn display_token_count(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
+#[cfg(test)]
 pub fn format_openai_responses_trace(turns: &[OpenAIResponsesTurn]) -> String {
     let mut output = String::from("Agent trace:");
     for (index, turn) in turns.iter().enumerate() {
@@ -3417,6 +3957,121 @@ responses:
             .join("")
     }
 
+    #[test]
+    fn responses_debug_request_summary_excludes_model_content() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "prompt-secret"}]
+            }],
+            "instructions": "instructions-secret",
+            "stream": true,
+            "store": false,
+            "multi_agent": {"enabled": true},
+            "tools": [{
+                "type": "web_search",
+                "filters": {"allowed_domains": ["secret.example"]}
+            }],
+            "tool_choice": "auto",
+            "reasoning": {"effort": "high", "summary": "reasoning-secret"},
+            "max_output_tokens": 16000
+        });
+
+        let summary = openai_responses_request_log_body(&body);
+        let rendered = summary.to_string();
+
+        assert_eq!(summary["model"], "gpt-5.6-sol");
+        assert_eq!(summary["input_items"], 1);
+        assert_eq!(summary["instructions_present"], true);
+        assert_eq!(summary["tool_types"], json!(["web_search"]));
+        assert_eq!(summary["tool_choice"], "auto");
+        for secret in [
+            "prompt-secret",
+            "instructions-secret",
+            "secret.example",
+            "reasoning-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn live_status_coalesces_deltas_and_keeps_output_agent_context() {
+        let (progress, mut trace_rx) = OpenAIResponsesProgress::live();
+        let mut live_state = OpenAIResponsesLiveStreamState::default();
+        observe_openai_responses_stream_event(
+            &json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "response_id": "resp_live",
+                "output_index": 7,
+                "item": {
+                    "type": "message",
+                    "agent": {"agent_name": "/root/researcher"}
+                }
+            }),
+            "response.output_item.added",
+            Some("resp_live"),
+            Some(1),
+            &mut live_state,
+            Some(&progress),
+        );
+        for sequence_number in 2..10_002 {
+            observe_openai_responses_stream_event(
+                &json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": sequence_number,
+                    "response_id": "resp_live",
+                    "output_index": 7,
+                    "delta": "delta-secret"
+                }),
+                "response.output_text.delta",
+                Some("resp_live"),
+                Some(sequence_number),
+                &mut live_state,
+                Some(&progress),
+            );
+        }
+
+        let snapshot = progress.live_snapshot();
+        assert_eq!(snapshot.response_id.as_deref(), Some("resp_live"));
+        assert_eq!(
+            snapshot.event_type.as_deref(),
+            Some("response.output_text.delta")
+        );
+        assert_eq!(snapshot.output_index, Some(7));
+        assert_eq!(snapshot.item_type.as_deref(), Some("message"));
+        assert_eq!(snapshot.agent_name.as_deref(), Some("/root/researcher"));
+        assert!(trace_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_progress_formatter_is_bounded_and_reports_heartbeat_state() {
+        let now = std::time::Instant::now();
+        let snapshot = OpenAIResponsesLiveSnapshot {
+            started_at: Some(now - Duration::from_secs(65)),
+            last_event_at: Some(now - Duration::from_secs(3)),
+            response_id: Some(format!("resp\n\u{001b}[31m{}", "x".repeat(200))),
+            event_type: Some("response.reasoning_summary_text.delta\nsecret".to_string()),
+            sequence_number: Some(42),
+            output_index: Some(3),
+            item_type: Some("reasoning".to_string()),
+            agent_name: Some("/root/researcher".to_string()),
+            action: None,
+        };
+
+        let formatted = format_openai_responses_live_progress(&snapshot, now);
+
+        assert!(formatted.contains("Generating 01:05"));
+        assert!(formatted.contains("idle=3s"));
+        assert!(formatted.contains("seq=42"));
+        assert!(formatted.contains("output=3"));
+        assert!(!formatted.contains('\n'));
+        assert!(!formatted.contains('\u{001b}'));
+        assert!(formatted.len() < 360);
+    }
+
     #[tokio::test]
     async fn responses_sse_returns_full_terminal_response() {
         let response = json!({
@@ -3451,6 +4106,128 @@ responses:
             .unwrap();
 
         assert_eq!(actual, response);
+    }
+
+    #[tokio::test]
+    async fn responses_sse_emits_sanitized_live_agent_and_web_search_trace() {
+        let response = json!({
+            "id": "resp_live",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "multi_agent_call",
+                    "call_id": "call_spawn",
+                    "action": "spawn_agent",
+                    "arguments": "{\"task_name\":\"research\",\"message\":\"spawn-secret\"}",
+                    "agent": {"agent_name": "/root"}
+                },
+                {
+                    "type": "agent_message",
+                    "id": "message_1",
+                    "author": "/root/researcher",
+                    "recipient": "/root",
+                    "content": [{"encrypted_content": "message-secret"}]
+                },
+                {
+                    "type": "agent_message",
+                    "id": "message_2",
+                    "author": "/root/researcher",
+                    "recipient": "/root",
+                    "content": [{"encrypted_content": "message-secret-2"}]
+                }
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        });
+        let body = responses_sse_body(&[
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_live", "status": "in_progress"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "response_id": "resp_live",
+                "output_index": 0,
+                "item": {
+                    "type": "multi_agent_call",
+                    "id": "call_item_1",
+                    "call_id": "call_spawn",
+                    "action": "spawn_agent",
+                    "agent": {"agent_name": "/root"}
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 2,
+                "response_id": "resp_live",
+                "output_index": 0,
+                "item": {
+                    "type": "multi_agent_call",
+                    "id": "call_item_1",
+                    "call_id": "call_spawn",
+                    "arguments": "{\"task_name\":\"research\",\"message\":\"spawn-secret\"}"
+                }
+            }),
+            json!({
+                "type": "response.web_search_call.searching",
+                "sequence_number": 3,
+                "response_id": "resp_live",
+                "agent": {"agent_name": "/root/researcher"},
+                "output_index": 1,
+                "query": "query-secret",
+                "sources": [{"url": "https://source-secret.example"}]
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 4,
+                "response_id": "resp_live",
+                "output_index": 2,
+                "delta": "delta-secret"
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 5,
+                "response": response.clone()
+            }),
+        ]);
+        let builder = sse_fixture_builder(&body).await.unwrap();
+        let (progress, mut trace_rx) = OpenAIResponsesProgress::live();
+
+        let actual =
+            send_openai_responses_request_with_progress(builder, "client-fixture", Some(&progress))
+                .await
+                .unwrap();
+        let mut lines = Vec::new();
+        while let Ok(event) = trace_rx.try_recv() {
+            lines.push(event.line().to_string());
+        }
+        let rendered = lines.join("\n");
+
+        assert_eq!(actual, response);
+        assert!(rendered.contains("status=created"));
+        assert!(rendered.contains("hosted_call actor=/root action=spawn_agent"));
+        assert!(rendered.contains("task=research"));
+        assert!(rendered.contains("agent_message author=/root/researcher recipient=/root"));
+        assert!(rendered.contains("web_search agent=/root/researcher status=searching"));
+        assert!(rendered.contains("status=completed"));
+        assert_eq!(rendered.matches("hosted_call actor=").count(), 1);
+        assert_eq!(rendered.matches("agent_message author=").count(), 2);
+        assert!(!rendered.contains("action=unknown"));
+        assert!(!rendered.contains("actor=unavailable"));
+        for secret in [
+            "spawn-secret",
+            "message-secret",
+            "message-secret-2",
+            "query-secret",
+            "source-secret",
+            "delta-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+        let snapshot = progress.live_snapshot();
+        assert_eq!(snapshot.response_id.as_deref(), Some("resp_live"));
+        assert_eq!(snapshot.event_type.as_deref(), Some("response.completed"));
     }
 
     #[tokio::test]

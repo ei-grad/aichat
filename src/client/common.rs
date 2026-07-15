@@ -528,7 +528,25 @@ impl RequestData {
     pub fn into_builder(self, client: &ReqwestClient) -> RequestBuilder {
         let RequestData { url, headers, body } = self;
         debug!("Request {url} {body}");
+        Self::build_request(client, url, headers, body)
+    }
 
+    pub fn into_builder_with_log_body(
+        self,
+        client: &ReqwestClient,
+        log_body: Value,
+    ) -> RequestBuilder {
+        let RequestData { url, headers, body } = self;
+        debug!("Request {url} {log_body}");
+        Self::build_request(client, url, headers, body)
+    }
+
+    fn build_request(
+        client: &ReqwestClient,
+        url: String,
+        headers: IndexMap<String, String>,
+        body: Value,
+    ) -> RequestBuilder {
         let mut builder = client.post(url);
         for (key, value) in headers {
             builder = builder.header(key, value);

@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use crossterm::{cursor, queue, style, terminal};
 use std::{
     future::Future,
-    io::{stdout, Write},
+    io::{stderr, stdout, Write},
     time::Duration,
 };
 use tokio::{
@@ -64,6 +64,22 @@ impl SpinnerInner {
         writer.flush()?;
         Ok(())
     }
+
+    fn print_line(&mut self, line: String) -> Result<()> {
+        if *IS_STDOUT_TERMINAL && !self.message.is_empty() {
+            let mut writer = stdout();
+            queue!(
+                writer,
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::CurrentLine)
+            )?;
+            writer.flush()?;
+        }
+        let mut writer = stderr();
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -87,10 +103,16 @@ impl Spinner {
         let _ = self.0.send(SpinnerEvent::Stop);
         std::thread::sleep(Duration::from_millis(10));
     }
+
+    pub fn print_line(&self, line: String) -> Result<()> {
+        self.0.send(SpinnerEvent::PrintLine(line))?;
+        Ok(())
+    }
 }
 
 pub enum SpinnerEvent {
     SetMessage(String),
+    PrintLine(String),
     Stop,
 }
 
@@ -106,6 +128,9 @@ pub fn spawn_spinner(message: &str) -> Spinner {
                         match evt {
                             SpinnerEvent::SetMessage(message) => {
                                 spinner.set_message(message)?;
+                            }
+                            SpinnerEvent::PrintLine(line) => {
+                                spinner.print_line(line)?;
                             }
                             SpinnerEvent::Stop => {
                                 spinner.clear_message()?;
@@ -188,21 +213,19 @@ async fn run_abortable_spinner(
 
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        match done_rx.try_recv() {
-            Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                break;
+        let done = matches!(
+            done_rx.try_recv(),
+            Ok(_) | Err(oneshot::error::TryRecvError::Closed)
+        );
+        while let Ok(event) = spinner_rx.try_recv() {
+            match event {
+                SpinnerEvent::SetMessage(message) => spinner.set_message(message)?,
+                SpinnerEvent::PrintLine(line) => spinner.print_line(line)?,
+                SpinnerEvent::Stop => spinner.clear_message()?,
             }
-            _ => {}
         }
-
-        match spinner_rx.try_recv() {
-            Ok(SpinnerEvent::SetMessage(message)) => {
-                spinner.set_message(message)?;
-            }
-            Ok(SpinnerEvent::Stop) => {
-                spinner.clear_message()?;
-            }
-            Err(_) => {}
+        if done {
+            break;
         }
 
         if poll_abort_signal(&abort_signal)? {

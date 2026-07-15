@@ -16,8 +16,9 @@ use crate::cli::Cli;
 use crate::client::{
     call_chat_completions, call_chat_completions_streaming, format_usage_cost, list_models,
     openai_responses::{
-        format_openai_responses_trace, format_openai_responses_usage_cost,
-        run_openai_responses_multi_agent, OpenAIResponsesOutput, OpenAIResponsesProgress,
+        format_openai_responses_live_progress, format_openai_responses_usage_cost,
+        run_openai_responses_multi_agent, OpenAIResponsesLiveTraceEvent, OpenAIResponsesOutput,
+        OpenAIResponsesProgress,
     },
     ModelType, TokenUsage,
 };
@@ -35,7 +36,13 @@ use clap::Parser;
 use inquire::Text;
 use parking_lot::RwLock;
 use simplelog::{format_description, ConfigBuilder, LevelFilter, SimpleLogger, WriteLogger};
-use std::{env, process, sync::Arc};
+use std::{
+    env,
+    path::Path,
+    process,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -368,36 +375,90 @@ async fn run_multi_agent_directive(
     abort_signal: AbortSignal,
 ) -> Result<OpenAIResponsesOutput> {
     let model = input.role().model().clone();
-    let progress = OpenAIResponsesProgress::default();
+    let (progress, mut live_trace_rx) = OpenAIResponsesProgress::live();
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
+    let show_trace = config.read().multi_agent.show_trace;
+    let debug_logging = log::log_enabled!(log::Level::Debug);
+    let debug_logs_to_stderr = debug_logging && logger_targets_stderr();
     config.write().before_chat_completion(&input)?;
-    let result = abortable_run_with_spinner(
-        run_openai_responses_multi_agent(config, &input, abort_signal.clone(), progress.clone()),
-        "Generating",
-        abort_signal,
-    )
-    .await;
+    let (spinner, spinner_rx) = Spinner::create(if debug_logs_to_stderr || !*IS_STDOUT_TERMINAL {
+        ""
+    } else {
+        "Generating"
+    });
+    let request_progress = progress.clone();
+    let request =
+        run_openai_responses_multi_agent(config, &input, abort_signal.clone(), request_progress);
+    let live_run = async {
+        tokio::pin!(request);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_debug_heartbeat = None;
+        let mut trace_header_printed = false;
+        let mut render_trace = |event: OpenAIResponsesLiveTraceEvent| -> Result<()> {
+            if !show_trace {
+                return Ok(());
+            }
+            let line = if trace_header_printed {
+                format!("  {}", event.line())
+            } else {
+                trace_header_printed = true;
+                format!("Agent trace (live):\n  {}", event.line())
+            };
+            if *IS_STDOUT_TERMINAL {
+                spinner.print_line(line)?;
+            } else {
+                eprintln!("{line}");
+            }
+            Ok(())
+        };
+
+        loop {
+            tokio::select! {
+                result = &mut request => {
+                    while let Ok(event) = live_trace_rx.try_recv() {
+                        render_trace(event)?;
+                    }
+                    break result;
+                }
+                Some(event) = live_trace_rx.recv() => {
+                    render_trace(event)?;
+                }
+                _ = heartbeat.tick() => {
+                    let now = Instant::now();
+                    let message = format_openai_responses_live_progress(
+                        &progress.live_snapshot(),
+                        now,
+                    );
+                    if !debug_logs_to_stderr && *IS_STDOUT_TERMINAL {
+                        spinner.set_message(message.clone())?;
+                    }
+                    let should_log_heartbeat = match last_debug_heartbeat {
+                        Some(last) => now.duration_since(last) >= Duration::from_secs(10),
+                        None => true,
+                    };
+                    if should_log_heartbeat {
+                        debug!("OpenAI Responses heartbeat: {message}");
+                        last_debug_heartbeat = Some(now);
+                    }
+                }
+            }
+        }
+    };
+    let result = abortable_run_with_spinner_rx(live_run, spinner_rx, abort_signal.clone()).await;
     let mut output = match result {
         Ok(output) => output,
         Err(error) => {
             let (turns, pricing_context) = progress.snapshot();
-            if !turns.is_empty() {
-                if config.read().multi_agent.show_trace {
-                    eprintln!("{}", format_openai_responses_trace(&turns));
-                }
-                if config.read().show_cost {
-                    eprintln!(
-                        "Partial Responses usage before failure:\n{}",
-                        format_openai_responses_usage_cost(&model, &turns, pricing_context)
-                    );
-                }
+            if !turns.is_empty() && config.read().show_cost {
+                eprintln!(
+                    "Partial Responses usage before failure:\n{}",
+                    format_openai_responses_usage_cost(&model, &turns, pricing_context)
+                );
             }
             return Err(error);
         }
     };
-    if config.read().multi_agent.show_trace && !output.turns.is_empty() {
-        eprintln!("{}", format_openai_responses_trace(&output.turns));
-    }
     if extract_code {
         output.text = extract_code_block(&strip_think_tag(&output.text)).to_string();
     }
@@ -408,6 +469,18 @@ async fn run_multi_agent_directive(
         .write()
         .after_chat_completion(&input, &output.text, &[])?;
     Ok(output)
+}
+
+fn logger_targets_stderr() -> bool {
+    let Ok((_, log_path)) = Config::log_config(false) else {
+        return false;
+    };
+    match log_path.as_deref() {
+        None => true,
+        Some(path) => ["/dev/stderr", "/dev/fd/2", "/proc/self/fd/2"]
+            .iter()
+            .any(|candidate| path == Path::new(candidate)),
+    }
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
