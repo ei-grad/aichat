@@ -38,6 +38,7 @@ impl OpenAIClient {
         );
 
         request_data.bearer_auth(api_key);
+        request_data.header("x-client-request-id", uuid::Uuid::new_v4());
         request_data.header("OpenAI-Beta", "responses_multi_agent=v1");
         if let Some(organization_id) = &self.config.organization_id {
             request_data.header("OpenAI-Organization", organization_id);

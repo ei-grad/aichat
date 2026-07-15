@@ -1390,7 +1390,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Claude request failed (status: 529, type: overloaded_error): STREAM_HTTP_BODY_SENTINEL"
+            "Claude request failed (status: 529, type: overloaded_error): STREAM_HTTP_BODY_SENTINEL (status: 529, content-type: application/json, body-bytes: 75)"
         );
         assert!(matches!(
             rx.try_recv(),
@@ -1426,7 +1426,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Invalid response event-stream (status: 200, content-type: application/json)"
+            "Invalid response event-stream (status: 200, content-type: application/json, body-bytes: 34)"
         );
         assert!(!err.to_string().contains(BODY_SENTINEL));
         assert!(matches!(

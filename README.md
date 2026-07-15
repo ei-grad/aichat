@@ -107,6 +107,8 @@ aichat --show-cost --multi-agent -m openai:gpt-5.6-sol:high \
 
 Subagents receive both the local developer functions selected by `use_tools` and configured hosted tools. A local function named `web_search` remains distinct from the OpenAI-hosted `web_search` tool. First-class hosted tools require the canonical `https://api.openai.com/v1/responses` endpoint.
 
+Multi-agent HTTP runs use Responses server-sent events and take the complete response from the terminal `response.completed`, `response.failed`, or `response.incomplete` event. AIChat disables automatic EventSource reconnection so a dropped stream cannot silently replay a potentially billable POST. A transient HTTP error may be retried only before the stream opens; later transport failures include the response position when available and remain non-retryable. Responses patches must preserve `stream: true`.
+
 Advanced transports can patch Responses requests separately from Chat Completions:
 
 ```yaml

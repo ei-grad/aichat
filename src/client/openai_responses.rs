@@ -1,8 +1,8 @@
 use super::registry::init_openai_client;
 use super::{
-    catch_error, retry_request, ChatCompletionsData, ChatCompletionsOutput, Client, Message,
-    MessageContent, MessageContentPart, MessageRole, Model, RequestApi, RequestData, TokenUsage,
-    ToolCall,
+    catch_error, retry_request, sse_transport_failure, ChatCompletionsData, ChatCompletionsOutput,
+    Client, Message, MessageContent, MessageContentPart, MessageRole, Model, RequestApi,
+    RequestData, TokenUsage, ToolCall,
 };
 
 use crate::config::{
@@ -13,8 +13,10 @@ use crate::function::{eval_tool_calls_preserving_results, FunctionDeclaration};
 use crate::utils::{strip_think_tag, wait_abort_signal, AbortSignal};
 
 use anyhow::{bail, Context, Result};
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::{Client as ReqwestClient, RequestBuilder, Url};
+use reqwest_eventsource::{retry::Never, Event, RequestBuilderExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -300,6 +302,7 @@ fn build_openai_responses_multi_agent_body(
         "input": input,
         "instructions": MULTI_AGENT_INSTRUCTIONS,
         "store": false,
+        "stream": true,
         "include": include,
         "service_tier": settings.service_tier.as_str(),
         "multi_agent": multi_agent,
@@ -430,7 +433,29 @@ fn prepare_openai_responses_request(
 ) -> Result<RequestData> {
     let mut request = client.prepare_responses_request(body)?;
     client.patch_request_data_for_api(&mut request, RequestApi::Responses);
+    canonicalize_openai_client_request_id(&mut request);
+    if request.body.get("stream").and_then(Value::as_bool) != Some(true) {
+        bail!(
+            "OpenAI Responses multi-agent requires effective stream=true; \
+             patch.responses must not remove or disable it"
+        )
+    }
     Ok(request)
+}
+
+fn canonicalize_openai_client_request_id(request: &mut RequestData) {
+    let client_request_id = request
+        .headers
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-client-request-id"))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    request
+        .headers
+        .retain(|name, _| !name.eq_ignore_ascii_case("x-client-request-id"));
+    request.header("x-client-request-id", client_request_id);
 }
 
 fn is_public_openai_responses_endpoint(request: &RequestData) -> bool {
@@ -458,26 +483,175 @@ async fn send_openai_responses_turn(
     retry_request(|| {
         let request = prepare_openai_responses_request(client, body.clone());
         async move {
-            let request = request?.into_builder(http);
-            send_openai_responses_request(request).await
+            let request = request?;
+            let client_request_id = request
+                .headers
+                .get("x-client-request-id")
+                .context("OpenAI Responses request is missing x-client-request-id")?
+                .clone();
+            send_openai_responses_request(request.into_builder(http), &client_request_id).await
         }
     })
     .await
     .context("Failed to call OpenAI Responses api")
 }
 
-async fn send_openai_responses_request(builder: RequestBuilder) -> Result<Value> {
-    let response = builder.send().await?;
-    let status = response.status();
-    let data: Value = response
-        .json()
-        .await
-        .context("Invalid OpenAI Responses JSON payload")?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+async fn send_openai_responses_request(
+    builder: RequestBuilder,
+    client_request_id: &str,
+) -> Result<Value> {
+    let mut stream = builder.eventsource()?;
+    stream.set_retry_policy(Box::new(Never));
+    let mut opened = false;
+    let mut response_id = None;
+    let mut last_sequence_number = None;
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(Event::Open) => opened = true,
+            Ok(Event::Message(message)) => {
+                opened = true;
+                let data: Value = serde_json::from_str(&message.data).with_context(|| {
+                    format!(
+                        "Invalid OpenAI Responses SSE event JSON{}",
+                        responses_stream_position(
+                            response_id.as_deref(),
+                            last_sequence_number,
+                            client_request_id
+                        )
+                    )
+                })?;
+                last_sequence_number = data
+                    .get("sequence_number")
+                    .and_then(Value::as_u64)
+                    .or(last_sequence_number);
+                if response_id.is_none() {
+                    response_id = data
+                        .pointer("/response/id")
+                        .and_then(Value::as_str)
+                        .or_else(|| data.get("response_id").and_then(Value::as_str))
+                        .map(str::to_string);
+                }
+                let event_type = data.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "OpenAI Responses SSE event is missing type{}",
+                        responses_stream_position(
+                            response_id.as_deref(),
+                            last_sequence_number,
+                            client_request_id
+                        )
+                    )
+                })?;
+                match event_type {
+                    "response.completed" | "response.failed" | "response.incomplete" => {
+                        let response = data.get("response").cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "OpenAI Responses terminal SSE event '{}' is missing response{}",
+                                event_type,
+                                responses_stream_position(
+                                    response_id.as_deref(),
+                                    last_sequence_number,
+                                    client_request_id
+                                )
+                            )
+                        })?;
+                        stream.close();
+                        debug!("openai-responses-data: {response}");
+                        return Ok(response);
+                    }
+                    "error" => {
+                        stream.close();
+                        return Err(openai_responses_stream_error(
+                            &data,
+                            response_id.as_deref(),
+                            last_sequence_number,
+                            client_request_id,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) => {
+                let error = sse_transport_failure(
+                    error,
+                    &catch_error,
+                    true,
+                    (!opened).then_some(client_request_id),
+                )
+                .await;
+                if opened {
+                    return Err(anyhow::anyhow!(
+                        "OpenAI Responses SSE transport failed after the stream opened{}: {}",
+                        responses_stream_position(
+                            response_id.as_deref(),
+                            last_sequence_number,
+                            client_request_id
+                        ),
+                        error
+                    ));
+                }
+                return Err(error);
+            }
+        }
     }
-    debug!("openai-responses-data: {data}");
-    Ok(data)
+
+    bail!(
+        "OpenAI Responses SSE stream ended before a terminal event{}",
+        responses_stream_position(
+            response_id.as_deref(),
+            last_sequence_number,
+            client_request_id
+        )
+    )
+}
+
+fn responses_stream_position(
+    response_id: Option<&str>,
+    sequence_number: Option<u64>,
+    client_request_id: &str,
+) -> String {
+    let mut fields = vec![format!(
+        "x-client-request-id: {}",
+        sanitize_display(client_request_id, 128)
+    )];
+    if let Some(response_id) = response_id {
+        fields.push(format!(
+            "response_id: {}",
+            sanitize_display(response_id, 128)
+        ));
+    }
+    if let Some(sequence_number) = sequence_number {
+        fields.push(format!("sequence_number: {sequence_number}"));
+    }
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", fields.join(", "))
+    }
+}
+
+fn openai_responses_stream_error(
+    data: &Value,
+    response_id: Option<&str>,
+    sequence_number: Option<u64>,
+    client_request_id: &str,
+) -> anyhow::Error {
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|value| sanitize_display(value, 240))
+        .unwrap_or_else(|| "unknown streaming error".to_string());
+    let code = data
+        .get("code")
+        .and_then(Value::as_str)
+        .map(|value| format!(", code: {}", sanitize_display(value, 96)))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "OpenAI Responses stream error{}: {}{}",
+        responses_stream_position(response_id, sequence_number, client_request_id),
+        message,
+        code
+    )
 }
 
 fn execute_function_calls(
@@ -811,23 +985,27 @@ impl std::fmt::Display for OpenAIResponsesMultiAgentError {
             }
             Self::FailedResponse { response_id, error } => write!(
                 formatter,
-                "OpenAI Responses request '{response_id}' failed: {}",
-                display_optional_value(error)
+                "OpenAI Responses request '{}' failed: {}",
+                sanitize_display(response_id, 128),
+                display_response_error(error)
             ),
             Self::IncompleteResponse {
                 response_id,
                 incomplete_details,
             } => write!(
                 formatter,
-                "OpenAI Responses request '{response_id}' was incomplete: {}",
-                display_optional_value(incomplete_details)
+                "OpenAI Responses request '{}' was incomplete: {}",
+                sanitize_display(response_id, 128),
+                display_incomplete_details(incomplete_details)
             ),
             Self::UnexpectedStatus {
                 response_id,
                 status,
             } => write!(
                 formatter,
-                "OpenAI Responses request '{response_id}' has unsupported status '{status}'"
+                "OpenAI Responses request '{}' has unsupported status '{}'",
+                sanitize_display(response_id, 128),
+                sanitize_display(status, 64)
             ),
             Self::MalformedFunctionCall {
                 output_index,
@@ -839,7 +1017,8 @@ impl std::fmt::Display for OpenAIResponsesMultiAgentError {
             ),
             Self::MissingRootFinal { response_id } => write!(
                 formatter,
-                "OpenAI Responses request '{response_id}' completed without a root final answer"
+                "OpenAI Responses request '{}' completed without a root final answer",
+                sanitize_display(response_id, 128)
             ),
         }
     }
@@ -1444,11 +1623,40 @@ fn escape_markdown_label(value: &str) -> String {
         .collect()
 }
 
-fn display_optional_value(value: &Option<Value>) -> String {
+fn display_response_error(value: &Option<Value>) -> String {
+    let Some(error) = value.as_ref().and_then(Value::as_object) else {
+        return "no safe details".to_string();
+    };
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|value| sanitize_display(value, 240));
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|value| sanitize_display(value, 96));
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .map(|value| sanitize_display(value, 96));
+    let qualifier = error_type
+        .map(|value| format!("type: {value}"))
+        .or_else(|| code.map(|value| format!("code: {value}")));
+    match (message, qualifier) {
+        (Some(message), Some(qualifier)) => format!("{message} ({qualifier})"),
+        (Some(message), None) => message,
+        (None, Some(qualifier)) => qualifier,
+        (None, None) => "no safe details".to_string(),
+    }
+}
+
+fn display_incomplete_details(value: &Option<Value>) -> String {
     value
         .as_ref()
-        .map(Value::to_string)
-        .unwrap_or_else(|| "no details".to_string())
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .map(|reason| format!("reason: {}", sanitize_display(reason, 120)))
+        .unwrap_or_else(|| "no safe details".to_string())
 }
 
 pub fn format_openai_responses_usage_cost(
@@ -1919,7 +2127,8 @@ mod tests {
 
     use crate::cli::Cli;
     use crate::client::{
-        ImageUrl, ModelData, ModelType, OpenAIClient, OpenAIConfig, ResponsePricing,
+        response_fixture_builder_with_headers, sse_fixture_builder, ImageUrl, ModelData, ModelType,
+        OpenAIClient, OpenAIConfig, ResponsePricing,
     };
     use crate::config::{
         Config, OpenAIServiceTier, WebSearchContextSize, WebSearchFilters,
@@ -2617,6 +2826,55 @@ mod tests {
     }
 
     #[test]
+    fn failed_and_incomplete_details_are_allowlisted_and_bounded() {
+        const ERROR_SENTINEL: &str = "FAILED_ERROR_PRIVATE_SENTINEL";
+        const MESSAGE_TAIL: &str = "FAILED_MESSAGE_TAIL_SENTINEL";
+        let failed = json!({
+            "id": "resp_failed\n\u{202e}suffix",
+            "status": "failed",
+            "output": [],
+            "usage": null,
+            "error": {
+                "code": "server_error",
+                "message": format!("visible\n{}{}", "x".repeat(400), MESSAGE_TAIL),
+                "internal_details": ERROR_SENTINEL
+            },
+            "incomplete_details": null,
+        });
+        let failed_message = parse_openai_responses_multi_agent(&failed)
+            .unwrap_err()
+            .to_string();
+
+        assert!(failed_message.contains("visible x"));
+        assert!(failed_message.contains("code: server_error"));
+        assert!(!failed_message.contains(ERROR_SENTINEL));
+        assert!(!failed_message.contains(MESSAGE_TAIL));
+        assert!(!failed_message.contains('\n'));
+        assert!(!failed_message.contains('\u{202e}'));
+        assert!(failed_message.len() < 640);
+
+        let incomplete = json!({
+            "id": "resp_incomplete",
+            "status": "incomplete",
+            "output": [],
+            "usage": null,
+            "error": null,
+            "incomplete_details": {
+                "reason": format!("max_output_tokens\n{}", "y".repeat(200)),
+                "internal_details": "INCOMPLETE_PRIVATE_SENTINEL"
+            },
+        });
+        let incomplete_message = parse_openai_responses_multi_agent(&incomplete)
+            .unwrap_err()
+            .to_string();
+
+        assert!(incomplete_message.contains("reason: max_output_tokens y"));
+        assert!(!incomplete_message.contains("INCOMPLETE_PRIVATE_SENTINEL"));
+        assert!(!incomplete_message.contains('\n'));
+        assert!(incomplete_message.len() < 360);
+    }
+
+    #[test]
     fn rejects_null_output_array_as_invalid_outer_response() {
         let raw = json!({
             "id": "resp_null_output",
@@ -2982,6 +3240,7 @@ mod tests {
                 ],
                 "instructions": MULTI_AGENT_INSTRUCTIONS,
                 "store": false,
+                "stream": true,
                 "include": ["reasoning.encrypted_content"],
                 "service_tier": "auto",
                 "multi_agent": {
@@ -3034,6 +3293,7 @@ mod tests {
         assert_eq!(body["service_tier"], "auto");
         assert!(body.get("reasoning").is_none());
         assert!(body.get("tools").is_none());
+        assert_eq!(body["stream"], true);
         assert_eq!(body["multi_agent"], json!({"enabled": true}));
     }
 
@@ -3042,6 +3302,7 @@ mod tests {
         let body = json!({
             "model": "gpt-5.6-sol",
             "input": [],
+            "stream": true,
             "reasoning": {"effort": "high"}
         });
         let patch = serde_yaml::from_str(
@@ -3101,10 +3362,288 @@ responses:
             request.headers.get("authorization").map(String::as_str),
             Some("Bearer test-key")
         );
+        assert!(uuid::Uuid::parse_str(
+            request
+                .headers
+                .get("x-client-request-id")
+                .expect("client request id header")
+        )
+        .is_ok());
         assert_eq!(
             responses_pricing_context(&request, &client.model),
             OpenAIResponsesPricingContext::PublicApi
         );
+    }
+
+    #[test]
+    fn client_request_id_is_canonicalized_after_header_patches() {
+        let mut request = RequestData::new(
+            "https://api.openai.com/v1/responses",
+            json!({"stream": true}),
+        );
+        request.header("x-client-request-id", "generated-id");
+        request.header("X-Client-Request-Id", "configured-id");
+
+        canonicalize_openai_client_request_id(&mut request);
+
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("x-client-request-id"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("x-client-request-id")
+                .map(String::as_str),
+            Some("configured-id")
+        );
+    }
+
+    fn responses_sse_body(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|event| {
+                let event_type = event["type"].as_str().unwrap_or("message");
+                format!(
+                    "event: {event_type}\ndata: {}\n\n",
+                    serde_json::to_string(event).expect("serializable SSE fixture")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[tokio::test]
+    async fn responses_sse_returns_full_terminal_response() {
+        let response = json!({
+            "id": "resp_streamed",
+            "status": "completed",
+            "output": [{"type": "message", "content": []}],
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        });
+        let body = responses_sse_body(&[
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_streamed", "status": "in_progress"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "response_id": "resp_streamed",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": response.clone()
+            }),
+        ]);
+        let builder = sse_fixture_builder(&body).await.unwrap();
+
+        let actual = send_openai_responses_request(builder, "client-fixture")
+            .await
+            .unwrap();
+
+        assert_eq!(actual, response);
+    }
+
+    #[tokio::test]
+    async fn responses_sse_returns_failed_and_incomplete_envelopes_to_the_parser() {
+        for (event_type, status) in [
+            ("response.failed", "failed"),
+            ("response.incomplete", "incomplete"),
+        ] {
+            let response = json!({
+                "id": format!("resp_{status}"),
+                "status": status,
+                "output": [],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "error": (status == "failed").then(|| json!({
+                    "code": "server_error",
+                    "message": "provider failed"
+                })),
+                "incomplete_details": (status == "incomplete")
+                    .then(|| json!({"reason": "max_output_tokens"}))
+            });
+            let body = responses_sse_body(&[json!({
+                "type": event_type,
+                "sequence_number": 3,
+                "response": response.clone()
+            })]);
+            let builder = sse_fixture_builder(&body).await.unwrap();
+
+            let actual = send_openai_responses_request(builder, "client-fixture")
+                .await
+                .unwrap();
+
+            assert_eq!(actual, response);
+            assert!(parse_openai_responses_multi_agent(&actual).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_sse_reports_sanitized_top_level_error() {
+        let body = responses_sse_body(&[json!({
+            "type": "error",
+            "sequence_number": 4,
+            "response_id": "resp_error",
+            "code": "server_error",
+            "message": "hosted run failed",
+            "internal_details": "must-not-be-rendered"
+        })]);
+        let builder = sse_fixture_builder(&body).await.unwrap();
+
+        let error = send_openai_responses_request(builder, "client-fixture")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("hosted run failed"));
+        assert!(message.contains("server_error"));
+        assert!(message.contains("resp_error"));
+        assert!(message.contains("x-client-request-id: client-fixture"));
+        assert!(!message.contains("must-not-be-rendered"));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_http_json_error_keeps_server_and_client_request_ids() {
+        let body = json!({
+            "error": {
+                "type": "overloaded_error",
+                "message": "temporary provider failure",
+                "internal_details": "must-not-be-rendered"
+            }
+        })
+        .to_string();
+        let builder = response_fixture_builder_with_headers(
+            "503 Service Unavailable",
+            "Application/JSON",
+            &[("X-Request-Id", "req-server-json")],
+            &body,
+        )
+        .await
+        .unwrap();
+
+        let error = send_openai_responses_request(builder, "client-http-json")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("temporary provider failure"));
+        assert!(message.contains("x-request-id: req-server-json"));
+        assert!(message.contains("x-client-request-id: client-http-json"));
+        assert!(!message.contains("must-not-be-rendered"));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_rejects_malformed_and_truncated_protocols() {
+        let cases = [
+            "data: not-json\n\n".to_string(),
+            "data: {\"sequence_number\":1}\n\n".to_string(),
+            responses_sse_body(&[json!({
+                "type": "response.completed",
+                "sequence_number": 2
+            })]),
+            responses_sse_body(&[json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_truncated"}
+            })]),
+        ];
+
+        for body in cases {
+            let builder = sse_fixture_builder(&body).await.unwrap();
+            let error = send_openai_responses_request(builder, "client-fixture")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("OpenAI Responses"));
+            assert!(error
+                .to_string()
+                .contains("x-client-request-id: client-fixture"));
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_sse_never_reconnects_the_post_after_stream_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = responses_sse_body(&[json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp_no_reconnect"}
+        })]);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (reconnect_tx, reconnect_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let request_len = socket.read(&mut request).await.unwrap();
+            assert!(request_len > 0);
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            let reconnected = timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_ok();
+            reconnect_tx.send(reconnected).unwrap();
+        });
+        let builder = reqwest::Client::new()
+            .post(format!("http://{address}"))
+            .json(&json!({"stream": true}));
+
+        let result = timeout(
+            Duration::from_secs(1),
+            send_openai_responses_request(builder, "client-fixture"),
+        )
+        .await
+        .expect("truncated stream must terminate without reconnecting");
+
+        assert!(result.is_err());
+        assert!(!reconnect_rx.await.unwrap());
+    }
+
+    #[test]
+    fn responses_patch_cannot_disable_required_streaming() {
+        let patch = serde_yaml::from_str(
+            r#"
+responses:
+  'gpt-5\.6-sol':
+    body:
+      stream: false
+"#,
+        )
+        .expect("valid Responses patch");
+        let client = OpenAIClient {
+            global_config: Default::default(),
+            config: OpenAIConfig {
+                api_key: Some("test-key".into()),
+                patch: Some(patch),
+                ..Default::default()
+            },
+            model: responses_model(None),
+        };
+
+        let error = prepare_openai_responses_request(
+            &client,
+            json!({"model": "gpt-5.6-sol", "input": [], "stream": true}),
+        )
+        .err()
+        .expect("stream=false patch must fail before the request is sent");
+
+        assert!(error.to_string().contains("requires effective stream=true"));
     }
 
     #[test]
@@ -3128,9 +3667,11 @@ responses:
             },
             model: priced_responses_model(),
         };
-        let request =
-            prepare_openai_responses_request(&client, json!({"model": "gpt-5.6-sol", "input": []}))
-                .unwrap();
+        let request = prepare_openai_responses_request(
+            &client,
+            json!({"model": "gpt-5.6-sol", "input": [], "stream": true}),
+        )
+        .unwrap();
 
         assert_eq!(request.body["model"], "gpt-5.6-pro");
         let pricing_context = responses_pricing_context(&request, &client.model);
@@ -3207,6 +3748,7 @@ responses:
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["max_output_tokens"], 16_000);
         assert_eq!(body["service_tier"], "default");
+        assert_eq!(body["stream"], true);
         assert_eq!(body["multi_agent"]["max_concurrent_subagents"], 3);
         assert_eq!(body["reasoning"], json!({"effort": "high"}));
         assert!(body.get("reasoning_effort").is_none());
@@ -3301,6 +3843,7 @@ clients:
         assert_eq!(request.body["tool_choice"], "required");
         assert_eq!(request.body["max_output_tokens"], 16_000);
         assert_eq!(request.body["service_tier"], "default");
+        assert_eq!(request.body["stream"], true);
         assert_eq!(
             request.body["include"],
             json!([

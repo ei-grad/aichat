@@ -4,9 +4,12 @@ use crate::utils::AbortSignal;
 use anyhow::{anyhow, Context, Result};
 use async_stream::try_stream;
 use futures_util::{Stream, StreamExt};
-use reqwest::RequestBuilder;
+use reqwest::{
+    header::{HeaderValue, CONTENT_TYPE},
+    RequestBuilder, Response,
+};
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -212,20 +215,90 @@ pub struct SseMessage {
     pub data: String,
 }
 
-/// Convert an SSE transport failure into the error to surface, delegating
-/// API-level error bodies to the provider's error parser.
-async fn sse_transport_failure<E>(
+const MAX_SANITIZED_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_SANITIZED_ERROR_MESSAGE_BYTES: usize = 2048;
+const MAX_SANITIZED_ERROR_CODE_BYTES: usize = 128;
+
+struct BoundedResponseBody {
+    bytes: Vec<u8>,
+    observed_len: usize,
+    truncated: bool,
+}
+
+/// Convert an SSE transport failure into the error to surface. In sanitized
+/// mode, provider parsers receive only bounded, allowlisted error fields.
+pub(crate) async fn sse_transport_failure<E>(
     err: EventSourceError,
     handle_error: &E,
     sanitize_transport_errors: bool,
+    client_request_id: Option<&str>,
 ) -> anyhow::Error
 where
     E: Fn(&Value, u16) -> Result<()>,
 {
     match err {
+        EventSourceError::StreamEnded if sanitize_transport_errors => {
+            let client_request_id = normalized_diagnostic_value(client_request_id, false);
+            match client_request_id {
+                Some(client_request_id) => anyhow!(
+                    "SSE stream ended before protocol completion (x-client-request-id: {client_request_id})"
+                ),
+                None => anyhow!("SSE stream ended before protocol completion"),
+            }
+        }
         EventSourceError::StreamEnded => anyhow!("SSE stream ended before protocol completion"),
         EventSourceError::InvalidStatusCode(status, res) => {
             let status = status.as_u16();
+            if sanitize_transport_errors {
+                let content_type = normalized_header(res.headers().get(CONTENT_TYPE), true);
+                let request_id = normalized_header(res.headers().get("x-request-id"), false);
+                let client_request_id = normalized_diagnostic_value(client_request_id, false);
+                let body = match read_bounded_response_body(res).await {
+                    Ok(body) => body,
+                    Err(_) => {
+                        let diagnostics = transport_diagnostics(
+                            status,
+                            content_type.as_deref(),
+                            None,
+                            request_id.as_deref(),
+                            client_request_id.as_deref(),
+                        );
+                        return ProviderError::new(
+                            classify_provider_error(status, None),
+                            format!("Failed to read streaming error response ({diagnostics})"),
+                            Some(status),
+                        )
+                        .into();
+                    }
+                };
+                let diagnostics = transport_diagnostics(
+                    status,
+                    content_type.as_deref(),
+                    Some(&body),
+                    request_id.as_deref(),
+                    client_request_id.as_deref(),
+                );
+                let data = (!body.truncated)
+                    .then(|| serde_json::from_slice::<Value>(&body.bytes).ok())
+                    .flatten()
+                    .and_then(|data| sanitize_provider_error_data(&data));
+                if let Some(data) = data.as_ref() {
+                    if let Err(err) = handle_error(data, status) {
+                        if let Some(provider_error) = err.downcast_ref::<ProviderError>() {
+                            return provider_error
+                                .with_message_suffix(&format!(" ({diagnostics})"))
+                                .into();
+                        }
+                    }
+                }
+                return ProviderError::new(
+                    classify_provider_error(status, provider_error_hint(data.as_ref())),
+                    format!("Streaming request failed ({diagnostics})"),
+                    Some(status),
+                )
+                .into();
+            }
+
             let text = match res.text().await {
                 Ok(text) => text,
                 Err(err) => return err.into(),
@@ -233,14 +306,9 @@ where
             let data: Value = match text.parse() {
                 Ok(data) => data,
                 Err(_) => {
-                    let message = if sanitize_transport_errors {
-                        format!("Streaming request failed (status: {status})")
-                    } else {
-                        format!("Invalid response data: {text} (status: {status})")
-                    };
                     return ProviderError::new(
                         classify_provider_error(status, None),
-                        message,
+                        format!("Invalid response data: {text} (status: {status})"),
                         Some(status),
                     )
                     .into();
@@ -253,12 +321,38 @@ where
         }
         EventSourceError::InvalidContentType(header_value, res) => {
             let status = res.status().as_u16();
-            let content_type = header_value.to_str().unwrap_or_default();
             let message = if sanitize_transport_errors {
-                format!(
-                    "Invalid response event-stream (status: {status}, content-type: {content_type})"
-                )
+                let content_type = normalized_header(Some(&header_value), true);
+                let request_id = normalized_header(res.headers().get("x-request-id"), false);
+                let client_request_id = normalized_diagnostic_value(client_request_id, false);
+                let body = match read_bounded_response_body(res).await {
+                    Ok(body) => body,
+                    Err(_) => {
+                        let diagnostics = transport_diagnostics(
+                            status,
+                            content_type.as_deref(),
+                            None,
+                            request_id.as_deref(),
+                            client_request_id.as_deref(),
+                        );
+                        return ProviderError::new(
+                            ProviderErrorKind::InvalidResponse,
+                            format!("Failed to read invalid event-stream response ({diagnostics})"),
+                            Some(status),
+                        )
+                        .into();
+                    }
+                };
+                let diagnostics = transport_diagnostics(
+                    status,
+                    content_type.as_deref(),
+                    Some(&body),
+                    request_id.as_deref(),
+                    client_request_id.as_deref(),
+                );
+                format!("Invalid response event-stream ({diagnostics})")
             } else {
+                let content_type = header_value.to_str().unwrap_or_default();
                 match res.text().await {
                     Ok(text) => format!(
                         "Invalid response event-stream. content-type: {content_type}, data: {text}"
@@ -268,8 +362,176 @@ where
             };
             ProviderError::new(ProviderErrorKind::InvalidResponse, message, Some(status)).into()
         }
+        _ if sanitize_transport_errors => {
+            let client_request_id = normalized_diagnostic_value(client_request_id, false);
+            match client_request_id {
+                Some(client_request_id) => {
+                    anyhow!("SSE transport failed (x-client-request-id: {client_request_id})")
+                }
+                None => anyhow!("SSE transport failed"),
+            }
+        }
         _ => anyhow!("{err}"),
     }
+}
+
+async fn read_bounded_response_body(response: Response) -> Result<BoundedResponseBody> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = (MAX_SANITIZED_ERROR_BODY_BYTES + 1).saturating_sub(bytes.len());
+        let copy_len = remaining.min(chunk.len());
+        bytes.extend_from_slice(&chunk[..copy_len]);
+        if bytes.len() > MAX_SANITIZED_ERROR_BODY_BYTES || copy_len < chunk.len() {
+            let observed_len = bytes.len();
+            bytes.truncate(MAX_SANITIZED_ERROR_BODY_BYTES);
+            return Ok(BoundedResponseBody {
+                bytes,
+                observed_len,
+                truncated: true,
+            });
+        }
+    }
+    Ok(BoundedResponseBody {
+        observed_len: bytes.len(),
+        bytes,
+        truncated: false,
+    })
+}
+
+fn sanitize_provider_error_data(data: &Value) -> Option<Value> {
+    let error = data.get("error")?.as_object()?;
+    let mut sanitized = Map::new();
+    for (field, max_bytes) in [
+        ("type", MAX_SANITIZED_ERROR_CODE_BYTES),
+        ("code", MAX_SANITIZED_ERROR_CODE_BYTES),
+        ("message", MAX_SANITIZED_ERROR_MESSAGE_BYTES),
+    ] {
+        let Some(value) = error
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|value| sanitize_error_field(value, max_bytes))
+        else {
+            continue;
+        };
+        sanitized.insert(field.to_string(), Value::String(value));
+    }
+    (!sanitized.is_empty()).then(|| {
+        let mut envelope = Map::new();
+        envelope.insert("error".to_string(), Value::Object(sanitized));
+        Value::Object(envelope)
+    })
+}
+
+fn provider_error_hint(data: Option<&Value>) -> Option<&str> {
+    let error = data?.get("error")?;
+    error
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("code").and_then(Value::as_str))
+}
+
+fn sanitize_error_field(value: &str, max_bytes: usize) -> Option<String> {
+    let mut sanitized = String::with_capacity(value.len().min(max_bytes));
+    let mut pending_space = false;
+    for character in value.chars() {
+        let character = if character.is_control()
+            || character.is_whitespace()
+            || is_unicode_format_control(character)
+        {
+            pending_space = !sanitized.is_empty();
+            continue;
+        } else {
+            character
+        };
+        if sanitized.len() + usize::from(pending_space) + character.len_utf8() > max_bytes {
+            break;
+        }
+        if pending_space {
+            sanitized.push(' ');
+            pending_space = false;
+        }
+        sanitized.push(character);
+    }
+    let sanitized = sanitized.trim();
+    (!sanitized.is_empty()).then(|| sanitized.to_string())
+}
+
+fn is_unicode_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+fn normalized_header(value: Option<&HeaderValue>, lowercase: bool) -> Option<String> {
+    let value = value?.to_str().ok()?;
+    normalized_diagnostic_value(Some(value), lowercase)
+}
+
+fn normalized_diagnostic_value(value: Option<&str>, lowercase: bool) -> Option<String> {
+    let value = value?;
+    let mut normalized = String::with_capacity(value.len().min(256));
+    let mut pending_space = false;
+
+    for ch in value.chars() {
+        if normalized.len() >= 256 {
+            break;
+        }
+        if ch.is_ascii_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if !ch.is_ascii_graphic() {
+            continue;
+        }
+        if normalized.len() + usize::from(pending_space) + 1 > 256 {
+            break;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.push(if lowercase {
+            ch.to_ascii_lowercase()
+        } else {
+            ch
+        });
+    }
+
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn transport_diagnostics(
+    status: u16,
+    content_type: Option<&str>,
+    body: Option<&BoundedResponseBody>,
+    request_id: Option<&str>,
+    client_request_id: Option<&str>,
+) -> String {
+    let mut diagnostics = vec![format!("status: {status}")];
+    if let Some(content_type) = content_type {
+        diagnostics.push(format!("content-type: {content_type}"));
+    }
+    if let Some(body) = body {
+        if body.truncated {
+            diagnostics.push(format!("body-bytes: >= {}", body.observed_len));
+        } else {
+            diagnostics.push(format!("body-bytes: {}", body.observed_len));
+        }
+    }
+    if let Some(request_id) = request_id {
+        diagnostics.push(format!("x-request-id: {request_id}"));
+    }
+    if let Some(client_request_id) = client_request_id {
+        diagnostics.push(format!("x-client-request-id: {client_request_id}"));
+    }
+    diagnostics.join(", ")
 }
 
 /// SSE-backed provider event stream. `handle` translates one SSE message
@@ -308,8 +570,13 @@ where
                     }
                 }
                 Err(err) => {
-                    Err(sse_transport_failure(err, &handle_error, sanitize_transport_errors)
-                        .await)?;
+                    Err(sse_transport_failure(
+                        err,
+                        &handle_error,
+                        sanitize_transport_errors,
+                        None,
+                    )
+                    .await)?;
                 }
             }
         }
@@ -337,6 +604,16 @@ pub(crate) async fn response_fixture_builder(
     content_type: &str,
     body: &str,
 ) -> Result<RequestBuilder> {
+    response_fixture_builder_with_headers(status, content_type, &[], body).await
+}
+
+#[cfg(test)]
+pub(crate) async fn response_fixture_builder_with_headers(
+    status: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<RequestBuilder> {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -344,8 +621,12 @@ pub(crate) async fn response_fixture_builder(
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let extra_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     tokio::spawn(async move {
@@ -658,5 +939,229 @@ mod tests {
         let mut usage = TokenUsage::new(Some(100), Some(20));
         usage.add(TokenUsage::default());
         assert_eq!(usage, TokenUsage::default());
+    }
+
+    async fn sanitized_fixture_error(
+        status: &str,
+        content_type: &str,
+        request_id: &str,
+        body: &str,
+    ) -> Result<anyhow::Error> {
+        let builder = response_fixture_builder_with_headers(
+            status,
+            content_type,
+            &[("X-Request-Id", request_id)],
+            body,
+        )
+        .await?;
+        let mut stream =
+            sse_chat_event_stream(builder, |_message, _events| Ok(true), catch_error, true);
+        let event = stream
+            .next()
+            .await
+            .expect("fixture stream must produce a transport result");
+        Ok(event.expect_err("fixture transport must fail"))
+    }
+
+    #[tokio::test]
+    async fn sanitized_invalid_status_reports_safe_transport_diagnostics() -> Result<()> {
+        const BODY_SENTINEL: &str = "<html>UPSTREAM_GATEWAY_BODY_SENTINEL</html>";
+        let cases = [
+            (
+                "502 Bad Gateway",
+                "Text/Plain; Charset=UTF-8",
+                "req-empty-502",
+                "",
+                502,
+                "Streaming request failed (status: 502, content-type: text/plain; charset=utf-8, body-bytes: 0, x-request-id: req-empty-502)",
+            ),
+            (
+                "504 Gateway Timeout",
+                "Text/HTML; Charset=UTF-8",
+                "req-html-504",
+                BODY_SENTINEL,
+                504,
+                "Streaming request failed (status: 504, content-type: text/html; charset=utf-8, body-bytes: 43, x-request-id: req-html-504)",
+            ),
+        ];
+
+        for (status_line, content_type, request_id, body, status, expected_message) in cases {
+            let err = sanitized_fixture_error(status_line, content_type, request_id, body).await?;
+            assert_eq!(err.to_string(), expected_message);
+            assert!(!err.to_string().contains(BODY_SENTINEL));
+            assert_eq!(
+                err.downcast_ref::<ProviderError>(),
+                Some(&ProviderError::new(
+                    ProviderErrorKind::ServerError,
+                    expected_message,
+                    Some(status),
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_invalid_content_type_does_not_expose_body() -> Result<()> {
+        const BODY_SENTINEL: &str = "<html>CONTENT_TYPE_BODY_SENTINEL</html>";
+        let err = sanitized_fixture_error(
+            "200 OK",
+            "Application/JSON; Charset=UTF-8",
+            "req-content-type",
+            BODY_SENTINEL,
+        )
+        .await?;
+        let expected_message = "Invalid response event-stream (status: 200, content-type: application/json; charset=utf-8, body-bytes: 39, x-request-id: req-content-type)";
+
+        assert_eq!(err.to_string(), expected_message);
+        assert!(!err.to_string().contains(BODY_SENTINEL));
+        assert_eq!(
+            err.downcast_ref::<ProviderError>(),
+            Some(&ProviderError::new(
+                ProviderErrorKind::InvalidResponse,
+                expected_message,
+                Some(200),
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_invalid_status_keeps_provider_json_error() -> Result<()> {
+        let body = serde_json::json!({
+            "error": {
+                "type": "overloaded_error",
+                "message": "temporary provider failure"
+            }
+        })
+        .to_string();
+        let err = sanitized_fixture_error(
+            "502 Bad Gateway",
+            "Application/JSON",
+            "req-provider-json",
+            &body,
+        )
+        .await?;
+        let expected_message = format!(
+            "temporary provider failure (type: overloaded_error) (status: 502, content-type: application/json, body-bytes: {}, x-request-id: req-provider-json)",
+            body.len()
+        );
+
+        assert_eq!(err.to_string(), expected_message);
+        assert_eq!(
+            err.downcast_ref::<ProviderError>(),
+            Some(&ProviderError::new(
+                ProviderErrorKind::ServerError,
+                expected_message,
+                Some(502),
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_invalid_status_rejects_unknown_json_details() -> Result<()> {
+        const SENTINEL: &str = "UNKNOWN_JSON_BODY_SENTINEL";
+        let body = serde_json::json!({
+            "debug": SENTINEL,
+            "request": {"prompt": "must-not-be-rendered"}
+        })
+        .to_string();
+        let err = sanitized_fixture_error(
+            "500 Internal Server Error",
+            "Application/JSON",
+            "req-unknown-json",
+            &body,
+        )
+        .await?;
+        let message = err.to_string();
+
+        assert!(message.starts_with("Streaming request failed (status: 500"));
+        assert!(message.contains("x-request-id: req-unknown-json"));
+        assert!(!message.contains(SENTINEL));
+        assert!(!message.contains("must-not-be-rendered"));
+        assert!(err.downcast_ref::<ProviderError>().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_provider_message_removes_controls_and_is_bounded() -> Result<()> {
+        const TAIL_SENTINEL: &str = "MESSAGE_TAIL_SENTINEL";
+        let provider_message = format!(
+            "visible\n\u{2028}\u{2029}\u{202e}{}{}",
+            "x".repeat(MAX_SANITIZED_ERROR_MESSAGE_BYTES + 512),
+            TAIL_SENTINEL
+        );
+        let body = serde_json::json!({
+            "error": {
+                "type": "overloaded_error",
+                "message": provider_message
+            }
+        })
+        .to_string();
+        let err = sanitized_fixture_error(
+            "503 Service Unavailable",
+            "Application/JSON",
+            "req-bounded-message",
+            &body,
+        )
+        .await?;
+        let message = err.to_string();
+
+        assert!(message.contains("visible x"));
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{2028}'));
+        assert!(!message.contains('\u{2029}'));
+        assert!(!message.contains('\u{202e}'));
+        assert!(!message.contains(TAIL_SENTINEL));
+        assert!(message.len() < MAX_SANITIZED_ERROR_MESSAGE_BYTES + 512);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_error_body_read_is_capped() -> Result<()> {
+        const TAIL_SENTINEL: &str = "OVERSIZED_BODY_TAIL_SENTINEL";
+        let body = format!(
+            "{}{}",
+            "z".repeat(MAX_SANITIZED_ERROR_BODY_BYTES + 2048),
+            TAIL_SENTINEL
+        );
+        let err =
+            sanitized_fixture_error("502 Bad Gateway", "Text/Plain", "req-oversized-body", &body)
+                .await?;
+        let message = err.to_string();
+
+        assert!(message.contains(&format!(
+            "body-bytes: >= {}",
+            MAX_SANITIZED_ERROR_BODY_BYTES + 1
+        )));
+        assert!(!message.contains(TAIL_SENTINEL));
+        assert!(message.len() < 512);
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_headers_are_normalized_and_bounded() {
+        let content_type = HeaderValue::from_static("Text/HTML;  Charset=UTF-8");
+        assert_eq!(
+            normalized_header(Some(&content_type), true).as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+
+        let request_id = HeaderValue::from_bytes(b"  REQ-ABC\t shard  ")
+            .expect("fixture request ID must be a valid header");
+        assert_eq!(
+            normalized_header(Some(&request_id), false).as_deref(),
+            Some("REQ-ABC shard")
+        );
+
+        let oversized = HeaderValue::from_str(&"A".repeat(300))
+            .expect("fixture request ID must be a valid header");
+        assert_eq!(
+            normalized_header(Some(&oversized), false)
+                .expect("header must remain present")
+                .len(),
+            256
+        );
     }
 }

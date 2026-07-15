@@ -55,6 +55,14 @@ impl ProviderError {
             _ => None,
         }
     }
+
+    pub(crate) fn with_message_suffix(&self, suffix: &str) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            message: format!("{}{suffix}", self.message),
+            status: self.status,
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderError {
