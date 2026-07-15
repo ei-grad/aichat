@@ -28,6 +28,12 @@ impl OpenAIClient {
 
     pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None)];
 
+    pub(super) fn responses_uses_public_pricing(&self) -> Result<bool> {
+        let api_base =
+            optional_config_field(self.get_api_base())?.unwrap_or_else(|| API_BASE.to_string());
+        Ok(api_base.trim_end_matches('/') == API_BASE)
+    }
+
     pub(super) fn prepare_responses_request(&self, body: Value) -> Result<RequestData> {
         let api_key = self.get_api_key()?;
         let api_base =

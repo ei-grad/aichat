@@ -39,6 +39,9 @@ pub struct Cli {
     /// Limit the number of concurrent hosted subagents
     #[clap(long, value_name = "N")]
     pub max_concurrent_subagents: Option<NonZeroUsize>,
+    /// Display sanitized multi-agent activity on stderr
+    #[clap(long)]
+    pub show_agent_trace: bool,
     /// Start a RAG
     #[clap(long)]
     pub rag: Option<String>,
@@ -279,6 +282,15 @@ mod tests {
         let cli = parse(&["aichat", "--multi-agent"]);
         assert!(cli.multi_agent);
         assert_eq!(cli.max_concurrent_subagents, None);
+    }
+
+    #[test]
+    fn parses_agent_trace_flag() {
+        let cli = parse(&["aichat", "--multi-agent", "--show-agent-trace", "delegate"]);
+
+        assert!(cli.multi_agent);
+        assert!(cli.show_agent_trace);
+        assert_eq!(cli.text_with_stdin(""), Some("delegate".into()));
     }
 
     #[test]

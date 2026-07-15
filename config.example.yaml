@@ -24,6 +24,7 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 multi_agent:
   enabled: false
   max_concurrent_subagents: null # Optional positive concurrency limit when enabled
+  show_trace: false              # Display sanitized agent activity on stderr
 
 # ---- prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)

@@ -83,17 +83,38 @@ mod catalog_tests {
         let openai = provider(&catalog, "openai");
         let expanded = Model::from_config("openai", "openai", &openai.models);
 
-        for (name, input_price, output_price) in [
-            ("gpt-5.6", 5.0, 30.0),
-            ("gpt-5.6-sol", 5.0, 30.0),
-            ("gpt-5.6-terra", 2.5, 15.0),
-            ("gpt-5.6-luna", 1.0, 6.0),
+        for (name, input_price, output_price, cached_price, write_price) in [
+            ("gpt-5.6", 5.0, 30.0, 0.5, 6.25),
+            ("gpt-5.6-sol", 5.0, 30.0, 0.5, 6.25),
+            ("gpt-5.6-terra", 2.5, 15.0, 0.25, 3.125),
+            ("gpt-5.6-luna", 1.0, 6.0, 0.1, 1.25),
         ] {
             let catalog_model = model(openai, name);
             assert_eq!(catalog_model.max_input_tokens, Some(1_050_000));
             assert_eq!(catalog_model.max_output_tokens, Some(128_000));
             assert_eq!(catalog_model.input_price, Some(input_price));
             assert_eq!(catalog_model.output_price, Some(output_price));
+            let response_pricing = catalog_model
+                .response_pricing
+                .as_ref()
+                .expect("missing Responses pricing");
+            assert_eq!(response_pricing.cached_input_price, cached_price);
+            assert_eq!(response_pricing.cache_write_input_price, write_price);
+            assert_eq!(response_pricing.long_context_threshold, 272_000);
+            assert_eq!(response_pricing.long_context_input_multiplier, 2.0);
+            assert_eq!(response_pricing.long_context_output_multiplier, 1.5);
+            assert_eq!(
+                response_pricing.service_tier_multipliers.get("default"),
+                Some(&1.0)
+            );
+            assert_eq!(
+                response_pricing.service_tier_multipliers.get("flex"),
+                Some(&0.5)
+            );
+            assert_eq!(
+                response_pricing.service_tier_multipliers.get("priority"),
+                Some(&2.0)
+            );
             assert!(catalog_model.supports_vision);
             assert!(catalog_model.supports_function_calling);
             assert_eq!(
@@ -106,6 +127,9 @@ mod catalog_tests {
                 .filter(|model| model.real_name() == name)
                 .collect();
             assert_eq!(listed.len(), 7, "unexpected variants for openai:{name}");
+            assert!(listed
+                .iter()
+                .all(|model| { model.data().response_pricing == catalog_model.response_pricing }));
 
             let base = listed
                 .iter()

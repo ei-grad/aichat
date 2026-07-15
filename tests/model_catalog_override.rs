@@ -21,6 +21,7 @@ struct ModelRecord {
     max_input_tokens: Option<usize>,
     input_price: Option<f64>,
     output_price: Option<f64>,
+    response_pricing: Option<ResponsePricingRecord>,
     patch: Option<Value>,
     reasoning_efforts: Option<Vec<String>>,
     max_output_tokens: Option<isize>,
@@ -33,6 +34,17 @@ struct ModelRecord {
     max_tokens_per_chunk: Option<usize>,
     default_chunk_size: Option<usize>,
     max_batch_size: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ResponsePricingRecord {
+    cached_input_price: f64,
+    cache_write_input_price: f64,
+    long_context_threshold: u64,
+    long_context_input_multiplier: f64,
+    long_context_output_multiplier: f64,
+    service_tier_multipliers: BTreeMap<String, f64>,
 }
 
 fn catalog() -> Vec<ProviderModels> {
@@ -68,6 +80,38 @@ fn names(provider: &ProviderModels) -> Vec<&str> {
         .iter()
         .map(|model| model.name.as_str())
         .collect()
+}
+
+#[test]
+fn openai_gpt_5_6_models_include_response_pricing() {
+    let catalog = catalog();
+    let openai = provider(&catalog, "openai");
+
+    for (name, cached_price, write_price) in [
+        ("gpt-5.6", 0.5, 6.25),
+        ("gpt-5.6-sol", 0.5, 6.25),
+        ("gpt-5.6-terra", 0.25, 3.125),
+        ("gpt-5.6-luna", 0.1, 1.25),
+    ] {
+        let pricing = model(openai, name)
+            .response_pricing
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing response pricing for openai:{name}"));
+
+        assert_eq!(pricing.cached_input_price, cached_price);
+        assert_eq!(pricing.cache_write_input_price, write_price);
+        assert_eq!(pricing.long_context_threshold, 272_000);
+        assert_eq!(pricing.long_context_input_multiplier, 2.0);
+        assert_eq!(pricing.long_context_output_multiplier, 1.5);
+        assert_eq!(
+            pricing.service_tier_multipliers,
+            BTreeMap::from([
+                ("default".to_string(), 1.0),
+                ("flex".to_string(), 0.5),
+                ("priority".to_string(), 2.0),
+            ])
+        );
+    }
 }
 
 fn sampling_patch() -> Value {

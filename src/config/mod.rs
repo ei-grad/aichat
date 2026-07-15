@@ -102,6 +102,7 @@ static EDITOR: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 pub struct MultiAgentConfig {
     pub enabled: bool,
     pub max_concurrent_subagents: Option<NonZeroUsize>,
+    pub show_trace: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2810,13 +2811,15 @@ mod tests {
         assert_eq!(config.multi_agent, MultiAgentConfig::default());
         assert!(!config.multi_agent.enabled);
         assert_eq!(config.multi_agent.max_concurrent_subagents, None);
+        assert!(!config.multi_agent.show_trace);
     }
 
     #[test]
     fn multi_agent_config_deserializes_positive_concurrency_limit() {
-        let config: Config =
-            serde_yaml::from_str("multi_agent:\n  enabled: true\n  max_concurrent_subagents: 6\n")
-                .unwrap();
+        let config: Config = serde_yaml::from_str(
+            "multi_agent:\n  enabled: true\n  max_concurrent_subagents: 6\n  show_trace: true\n",
+        )
+        .unwrap();
 
         assert!(config.multi_agent.enabled);
         assert_eq!(
@@ -2826,6 +2829,7 @@ mod tests {
                 .map(NonZeroUsize::get),
             Some(6)
         );
+        assert!(config.multi_agent.show_trace);
     }
 
     #[test]

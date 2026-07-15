@@ -8,6 +8,16 @@
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
+      response_pricing: &gpt-5-6-sol-response-pricing
+        cached_input_price: 0.5
+        cache_write_input_price: 6.25
+        long_context_threshold: 272000
+        long_context_input_multiplier: 2
+        long_context_output_multiplier: 1.5
+        service_tier_multipliers:
+          default: 1
+          flex: 0.5
+          priority: 2
       supports_vision: true
       supports_function_calling: true
       reasoning_efforts: [none, low, medium, high, xhigh, max]
@@ -16,6 +26,7 @@
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
+      response_pricing: *gpt-5-6-sol-response-pricing
       supports_vision: true
       supports_function_calling: true
       reasoning_efforts: [none, low, medium, high, xhigh, max]
@@ -24,6 +35,16 @@
       max_output_tokens: 128000
       input_price: 2.5
       output_price: 15
+      response_pricing:
+        cached_input_price: 0.25
+        cache_write_input_price: 3.125
+        long_context_threshold: 272000
+        long_context_input_multiplier: 2
+        long_context_output_multiplier: 1.5
+        service_tier_multipliers:
+          default: 1
+          flex: 0.5
+          priority: 2
       supports_vision: true
       supports_function_calling: true
       reasoning_efforts: [none, low, medium, high, xhigh, max]
@@ -32,6 +53,16 @@
       max_output_tokens: 128000
       input_price: 1
       output_price: 6
+      response_pricing:
+        cached_input_price: 0.1
+        cache_write_input_price: 1.25
+        long_context_threshold: 272000
+        long_context_input_multiplier: 2
+        long_context_output_multiplier: 1.5
+        service_tier_multipliers:
+          default: 1
+          flex: 0.5
+          priority: 2
       supports_vision: true
       supports_function_calling: true
       reasoning_efforts: [none, low, medium, high, xhigh, max]

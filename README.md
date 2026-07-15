@@ -74,6 +74,21 @@ aichat --show-cost "Explain this code"
 
 Set `show_cost: true` in the config file to enable it by default, including in the REPL. The summary is written to stderr so response text on stdout remains safe to pipe. Cost requires both usage data from the provider and input/output prices in the model catalog.
 
+For OpenAI Responses multi-agent runs, the estimate is calculated separately for each continuation request. It accounts for cached input, cache writes, the actual service tier, and GPT-5.6 long-context multipliers when those fields and prices are available. If an exact calculation is not possible, the cost is reported as unavailable instead of assuming a pricing tier. Cost is also unavailable for custom or regional OpenAI `api_base` endpoints because their pricing may differ from the public API catalog. The API reports response-level usage for the agent tree, not per-agent usage, so AIChat does not invent per-agent token or cost totals.
+
+### OpenAI Responses Multi-agent
+
+GPT-5.6 models can use OpenAI's hosted multi-agent orchestration in one-shot command mode:
+
+```sh
+aichat -m openai:gpt-5.6-sol --multi-agent --show-agent-trace --show-cost \
+  "Research the alternatives in parallel and reconcile the result"
+```
+
+`--show-agent-trace` writes a sanitized structural trace to stderr. It shows response turns, agent paths, collaboration actions, message direction, phases, and tool names without printing encrypted messages, prompts, tool arguments, or tool results. Set `multi_agent.show_trace: true` to enable it in the config.
+
+Subagents receive the tools selected by `use_tools`. OpenAI hosted tools such as Responses `web_search` are not enabled automatically; a local function named `web_search` is still a developer-defined AIChat tool.
+
 ### Role
 
 Customize roles to tailor LLM behavior, enhancing interaction efficiency and boosting productivity.

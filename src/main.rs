@@ -15,7 +15,11 @@ extern crate log;
 use crate::cli::Cli;
 use crate::client::{
     call_chat_completions, call_chat_completions_streaming, format_usage_cost, list_models,
-    openai_responses::run_openai_responses_multi_agent, ModelType, TokenUsage,
+    openai_responses::{
+        format_openai_responses_trace, format_openai_responses_usage_cost,
+        run_openai_responses_multi_agent, OpenAIResponsesOutput,
+    },
+    ModelType, TokenUsage,
 };
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
@@ -215,11 +219,19 @@ fn configure_multi_agent(config: &GlobalConfig, cli: &Cli) -> Result<()> {
             "--max-concurrent-subagents requires multi-agent mode; enable it with --multi-agent or multi_agent.enabled"
         );
     }
+    if cli.show_agent_trace && !enabled {
+        bail!(
+            "--show-agent-trace requires multi-agent mode; enable it with --multi-agent or multi_agent.enabled"
+        );
+    }
 
     let mut config = config.write();
     config.multi_agent.enabled = enabled;
     if let Some(max_concurrent_subagents) = cli.max_concurrent_subagents {
         config.multi_agent.max_concurrent_subagents = Some(max_concurrent_subagents);
+    }
+    if cli.show_agent_trace {
+        config.multi_agent.show_trace = true;
     }
     Ok(())
 }
@@ -252,7 +264,6 @@ fn validate_multi_agent_mode(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-#[async_recursion::async_recursion]
 async fn start_directive(
     config: &GlobalConfig,
     input: Input,
@@ -260,9 +271,20 @@ async fn start_directive(
     abort_signal: AbortSignal,
 ) -> Result<()> {
     let model = input.role().model().clone();
-    let usage = run_directive(config, input, code_mode, abort_signal).await?;
-    if config.read().show_cost {
-        eprintln!("{}", format_usage_cost(&model, usage));
+    let usage_summary = if config.read().multi_agent.enabled {
+        let output = run_multi_agent_directive(config, input, code_mode, abort_signal).await?;
+        config.read().show_cost.then(|| {
+            format_openai_responses_usage_cost(&model, &output.turns, output.pricing_context)
+        })
+    } else {
+        let usage = run_directive(config, input, code_mode, abort_signal).await?;
+        config
+            .read()
+            .show_cost
+            .then(|| format_usage_cost(&model, usage))
+    };
+    if let Some(summary) = usage_summary {
+        eprintln!("{summary}");
     }
     config.write().exit_session()?;
     Ok(())
@@ -275,10 +297,6 @@ async fn run_directive(
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<TokenUsage> {
-    if config.read().multi_agent.enabled {
-        return run_multi_agent_directive(config, input, code_mode, abort_signal).await;
-    }
-
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
@@ -318,7 +336,7 @@ async fn run_multi_agent_directive(
     input: Input,
     code_mode: bool,
     abort_signal: AbortSignal,
-) -> Result<TokenUsage> {
+) -> Result<OpenAIResponsesOutput> {
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     let max_concurrent_subagents = config.read().multi_agent.max_concurrent_subagents;
     config.write().before_chat_completion(&input)?;
@@ -333,6 +351,9 @@ async fn run_multi_agent_directive(
         abort_signal,
     )
     .await?;
+    if config.read().multi_agent.show_trace && !output.turns.is_empty() {
+        eprintln!("{}", format_openai_responses_trace(&output.turns));
+    }
     if extract_code {
         output.text = extract_code_block(&strip_think_tag(&output.text)).to_string();
     }
@@ -342,7 +363,7 @@ async fn run_multi_agent_directive(
     config
         .write()
         .after_chat_completion(&input, &output.text, &[])?;
-    Ok(output.usage())
+    Ok(output)
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
@@ -586,6 +607,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--max-concurrent-subagents requires multi-agent mode"));
+    }
+
+    #[test]
+    fn agent_trace_flag_requires_multi_agent_mode() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let cli = Cli::try_parse_from(["aichat", "--show-agent-trace", "prompt"]).unwrap();
+
+        let error = configure_multi_agent(&config, &cli).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("--show-agent-trace requires multi-agent mode"));
+    }
+
+    #[test]
+    fn agent_trace_flag_overrides_enabled_config() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.enabled = true;
+        let cli = Cli::try_parse_from(["aichat", "--show-agent-trace", "prompt"]).unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+
+        assert!(config.read().multi_agent.show_trace);
     }
 
     #[test]

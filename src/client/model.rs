@@ -10,6 +10,7 @@ use crate::utils::{estimate_token_length, strip_think_tag};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 
 const PER_MESSAGES_TOKENS: usize = 5;
@@ -456,6 +457,8 @@ pub struct ModelData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_pricing: Option<ResponsePricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub patch: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
@@ -483,6 +486,16 @@ pub struct ModelData {
     pub default_chunk_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_batch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResponsePricing {
+    pub cached_input_price: f64,
+    pub cache_write_input_price: f64,
+    pub long_context_threshold: u64,
+    pub long_context_input_multiplier: f64,
+    pub long_context_output_multiplier: f64,
+    pub service_tier_multipliers: BTreeMap<String, f64>,
 }
 
 impl ModelData {
