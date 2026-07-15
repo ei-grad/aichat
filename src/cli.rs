@@ -62,6 +62,9 @@ pub struct Cli {
     /// Turn off stream mode
     #[clap(short = 'S', long)]
     pub no_stream: bool,
+    /// Display token usage and estimated cost after the response
+    #[clap(long)]
+    pub show_cost: bool,
     /// Display the message without sending it
     #[clap(long)]
     pub dry_run: bool,
@@ -238,5 +241,12 @@ mod tests {
         let cli = parse(&["aichat"]);
         assert_eq!(cli.text_with_stdin("from stdin"), Some("from stdin".into()));
         assert_eq!(cli.text_with_stdin(""), None);
+    }
+
+    #[test]
+    fn parses_show_cost_flag() {
+        let cli = parse(&["aichat", "--show-cost", "hello"]);
+        assert!(cli.show_cost);
+        assert_eq!(cli.text_with_stdin(""), Some("hello".into()));
     }
 }

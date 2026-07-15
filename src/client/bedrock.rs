@@ -266,6 +266,12 @@ pub async fn bedrock_chat_events(builder: RequestBuilder) -> Result<ChatEventStr
                                     Some(function_id.clone()),
                                 ));
                             }
+                            "metadata" => {
+                                yield ChatEvent::Usage(TokenUsage::new(
+                                    data["usage"]["inputTokens"].as_u64(),
+                                    data["usage"]["outputTokens"].as_u64(),
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -353,6 +359,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         top_p,
         functions,
         stream: _,
+        include_usage: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -708,6 +715,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            include_usage: false,
         }
     }
 

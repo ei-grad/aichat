@@ -246,6 +246,7 @@ impl Input {
             top_p,
             functions,
             stream,
+            include_usage: self.config.read().show_cost,
         })
     }
 

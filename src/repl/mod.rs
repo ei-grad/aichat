@@ -6,9 +6,11 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming};
+use crate::client::{
+    call_chat_completions, call_chat_completions_streaming, format_usage_cost, TokenUsage,
+};
 use crate::config::{
-    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
+    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage, RoleLike,
     StateFlags,
 };
 use crate::render::render_error;
@@ -721,11 +723,26 @@ pub async fn run_repl_command(
 async fn ask(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-    mut input: Input,
+    input: Input,
     with_embeddings: bool,
 ) -> Result<()> {
+    let model = input.role().model().clone();
+    let usage = ask_inner(config, abort_signal, input, with_embeddings).await?;
+    if config.read().show_cost {
+        eprintln!("{}", format_usage_cost(&model, usage));
+    }
+    Ok(())
+}
+
+#[async_recursion::async_recursion]
+async fn ask_inner(
+    config: &GlobalConfig,
+    abort_signal: AbortSignal,
+    mut input: Input,
+    with_embeddings: bool,
+) -> Result<TokenUsage> {
     if input.is_empty() {
-        return Ok(());
+        return Ok(TokenUsage::default());
     }
     if with_embeddings {
         input.use_embeddings(abort_signal.clone()).await?;
@@ -743,19 +760,22 @@ async fn ask(
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+        .after_chat_completion(&input, &output.text, &tool_results)?;
+    let mut usage = output.usage();
     if !tool_results.is_empty() {
-        ask(
+        let next_usage = ask_inner(
             config,
             abort_signal,
-            input.merge_tool_results(output, tool_results),
+            input.merge_tool_results(output.text, tool_results),
             false,
         )
-        .await
+        .await?;
+        usage.add(next_usage);
+        Ok(usage)
     } else {
         Config::maybe_autoname_session(config.clone());
         Config::maybe_compress_session(config.clone());
-        Ok(())
+        Ok(usage)
     }
 }
 

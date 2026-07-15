@@ -1,7 +1,7 @@
 use super::{
     list_all_models, list_client_names,
     message::{Message, MessageContent, MessageContentPart},
-    ApiPatch, MessageContentToolCalls, RequestPatch,
+    ApiPatch, MessageContentToolCalls, RequestPatch, TokenUsage,
 };
 
 use crate::config::Config;
@@ -204,6 +204,12 @@ impl Model {
 
     pub fn max_output_tokens(&self) -> Option<isize> {
         self.data.max_output_tokens
+    }
+
+    pub fn usage_cost(&self, usage: TokenUsage) -> Option<f64> {
+        let input = usage.input_tokens? as f64 * self.data.input_price?;
+        let output = usage.output_tokens? as f64 * self.data.output_price?;
+        Some((input + output) / 1_000_000.0)
     }
 
     pub fn no_stream(&self) -> bool {

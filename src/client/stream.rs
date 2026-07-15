@@ -18,6 +18,47 @@ pub enum ChatEvent {
     Text(String),
     Reasoning(String),
     ToolCall(ToolCall),
+    Usage(TokenUsage),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    pub fn new(input_tokens: Option<u64>, output_tokens: Option<u64>) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if other.input_tokens.is_some() {
+            self.input_tokens = other.input_tokens;
+        }
+        if other.output_tokens.is_some() {
+            self.output_tokens = other.output_tokens;
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.input_tokens.is_none() && self.output_tokens.is_none()
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.input_tokens = sum_optional(self.input_tokens, other.input_tokens);
+        self.output_tokens = sum_optional(self.output_tokens, other.output_tokens);
+    }
+}
+
+fn sum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        _ => None,
+    }
 }
 
 pub type ChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>;
@@ -60,6 +101,7 @@ pub async fn drive_chat_events(stream: ChatEventStream, handler: &mut SseHandler
                 }
                 handler.tool_call(call)?;
             }
+            ChatEvent::Usage(usage) => handler.usage(usage),
         }
     }
     if reasoning {
@@ -70,7 +112,9 @@ pub async fn drive_chat_events(stream: ChatEventStream, handler: &mut SseHandler
 
 /// Collect a provider event stream into final text and tool calls, applying
 /// the same think-tag presentation as the streaming pump.
-pub async fn collect_chat_events(stream: ChatEventStream) -> Result<(String, Vec<ToolCall>)> {
+pub async fn collect_chat_events(
+    stream: ChatEventStream,
+) -> Result<(String, Vec<ToolCall>, TokenUsage)> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut handler = SseHandler::new(tx, crate::utils::create_abort_signal());
     drive_chat_events(stream, &mut handler).await?;
@@ -82,6 +126,7 @@ pub struct SseHandler {
     abort_signal: AbortSignal,
     buffer: String,
     tool_calls: Vec<ToolCall>,
+    usage: TokenUsage,
 }
 
 impl SseHandler {
@@ -91,6 +136,7 @@ impl SseHandler {
             abort_signal,
             buffer: String::new(),
             tool_calls: Vec::new(),
+            usage: TokenUsage::default(),
         }
     }
 
@@ -130,6 +176,10 @@ impl SseHandler {
         Ok(())
     }
 
+    pub fn usage(&mut self, usage: TokenUsage) {
+        self.usage.merge(usage);
+    }
+
     pub fn abort(&self) -> AbortSignal {
         self.abort_signal.clone()
     }
@@ -138,11 +188,14 @@ impl SseHandler {
         &self.tool_calls
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>) {
+    pub fn take(self) -> (String, Vec<ToolCall>, TokenUsage) {
         let Self {
-            buffer, tool_calls, ..
+            buffer,
+            tool_calls,
+            usage,
+            ..
         } = self;
-        (buffer, tool_calls)
+        (buffer, tool_calls, usage)
     }
 }
 
@@ -501,7 +554,7 @@ mod tests {
             &mut handler,
         )
         .await?;
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "<think>\nthought\n</think>\n\nanswer");
         assert!(calls.is_empty());
         Ok(())
@@ -515,7 +568,7 @@ mod tests {
             &mut handler,
         )
         .await?;
-        let (text, _) = handler.take();
+        let (text, _, _) = handler.take();
         assert_eq!(text, "<think>\nonly thought\n</think>\n\n");
         Ok(())
     }
@@ -535,7 +588,7 @@ mod tests {
             &mut handler,
         )
         .await?;
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "<think>\nplanning\n</think>\n\n");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search");
@@ -555,7 +608,7 @@ mod tests {
         .await
         .expect_err("stream error must propagate");
         assert_eq!(err.to_string(), "stream broke");
-        let (text, _) = handler.take();
+        let (text, _, _) = handler.take();
         assert_eq!(text, "<think>\nthinking\n</think>\n\n");
     }
 
@@ -572,8 +625,38 @@ mod tests {
         .await
         .expect_err("stream error must propagate");
         assert_eq!(err.to_string(), "stream broke");
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "partial");
         assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pump_merges_split_usage_events() -> Result<()> {
+        let (mut handler, _rx) = pump_handler();
+        drive_chat_events(
+            event_stream(vec![
+                Ok(ChatEvent::Usage(TokenUsage::new(Some(120), Some(0)))),
+                Ok(ChatEvent::Usage(TokenUsage::new(None, Some(30)))),
+            ]),
+            &mut handler,
+        )
+        .await?;
+        let (_, _, usage) = handler.take();
+        assert_eq!(usage, TokenUsage::new(Some(120), Some(30)));
+        Ok(())
+    }
+
+    #[test]
+    fn usage_adds_multiple_completion_rounds() {
+        let mut usage = TokenUsage::new(Some(100), Some(20));
+        usage.add(TokenUsage::new(Some(180), Some(40)));
+        assert_eq!(usage, TokenUsage::new(Some(280), Some(60)));
+    }
+
+    #[test]
+    fn usage_total_is_unavailable_when_any_round_omits_usage() {
+        let mut usage = TokenUsage::new(Some(100), Some(20));
+        usage.add(TokenUsage::default());
+        assert_eq!(usage, TokenUsage::default());
     }
 }

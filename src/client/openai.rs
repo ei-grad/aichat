@@ -202,6 +202,15 @@ fn handle_openai_stream_message(
 
     let data: Value = serde_json::from_str(message).context("Invalid OpenAI streaming response")?;
     debug!("stream-data: {data}");
+    if data.get("usage").is_some_and(|usage| !usage.is_null()) {
+        let usage = TokenUsage::new(
+            data["usage"]["prompt_tokens"].as_u64(),
+            data["usage"]["completion_tokens"].as_u64(),
+        );
+        if !usage.is_empty() {
+            events.push(ChatEvent::Usage(usage));
+        }
+    }
     if let Some(text) = data["choices"][0]["delta"]["content"]
         .as_str()
         .filter(|v| !v.is_empty())
@@ -277,6 +286,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         top_p,
         functions,
         stream,
+        include_usage,
     } = data;
 
     let messages_len = messages.len();
@@ -374,6 +384,9 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         body["top_p"] = v.into();
     }
     body["stream"] = stream.into();
+    if stream && include_usage {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if let Some(functions) = functions {
         body["tools"] = functions
             .iter()
@@ -494,6 +507,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream,
+            include_usage: true,
         }
     }
 
@@ -551,9 +565,36 @@ mod tests {
 
         let non_streaming = openai_build_chat_completions_body(completion_data(false), &model);
         let streaming = openai_build_chat_completions_body(completion_data(true), &model);
+        let mut streaming_without_usage = completion_data(true);
+        streaming_without_usage.include_usage = false;
+        let streaming_without_usage =
+            openai_build_chat_completions_body(streaming_without_usage, &model);
 
         assert_eq!(non_streaming["stream"], json!(false));
         assert_eq!(streaming["stream"], json!(true));
+        assert!(non_streaming.get("stream_options").is_none());
+        assert_eq!(streaming["stream_options"]["include_usage"], json!(true));
+        assert!(streaming_without_usage.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn stream_usage_becomes_a_typed_event() -> Result<()> {
+        let mut state = OpenAiToolCallAccumulator::default();
+        let mut events = Vec::new();
+        handle_openai_stream_message(
+            &mut state,
+            &mut events,
+            &json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+            })
+            .to_string(),
+        )?;
+        assert_eq!(
+            events,
+            [ChatEvent::Usage(TokenUsage::new(Some(12), Some(7)))]
+        );
+        Ok(())
     }
 
     #[test]
@@ -615,7 +656,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -636,7 +677,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("openai", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "side_effect");
@@ -766,7 +807,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("openai", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "<think>\nreason\n</think>\n\nanswer");
         assert!(calls.is_empty());
         Ok(())

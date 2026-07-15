@@ -286,10 +286,12 @@ pub trait Client: Sync + Send {
     ) -> Result<ChatCompletionsOutput> {
         data.stream = true;
         let stream = self.chat_events_inner(client, data).await?;
-        let (text, tool_calls) = collect_chat_events(stream).await?;
+        let (text, tool_calls, usage) = collect_chat_events(stream).await?;
         Ok(ChatCompletionsOutput {
             text,
             tool_calls,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
             ..Default::default()
         })
     }
@@ -452,6 +454,7 @@ pub struct ChatCompletionsData {
     pub top_p: Option<f64>,
     pub functions: Option<Vec<FunctionDeclaration>>,
     pub stream: bool,
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -463,12 +466,32 @@ pub struct ChatCompletionsOutput {
     pub output_tokens: Option<u64>,
 }
 
+pub fn format_usage_cost(model: &Model, usage: TokenUsage) -> String {
+    let input = usage
+        .input_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    let output = usage
+        .output_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    let cost = model
+        .usage_cost(usage)
+        .map(|value| format!("${value:.6}"))
+        .unwrap_or_else(|| "unavailable".into());
+    format!("Tokens: {input} input + {output} output | Estimated cost: {cost}")
+}
+
 impl ChatCompletionsOutput {
     pub fn new(text: &str) -> Self {
         Self {
             text: text.to_string(),
             ..Default::default()
         }
+    }
+
+    pub fn usage(&self) -> TokenUsage {
+        TokenUsage::new(self.input_tokens, self.output_tokens)
     }
 }
 
@@ -573,7 +596,7 @@ pub async fn call_chat_completions(
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<(ChatCompletionsOutput, Vec<ToolResult>)> {
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         "Generating",
@@ -583,11 +606,9 @@ pub async fn call_chat_completions(
 
     match ret {
         Ok(ret) => {
-            let ChatCompletionsOutput {
-                mut text,
-                tool_calls,
-                ..
-            } = ret;
+            let mut output = ret;
+            let mut text = std::mem::take(&mut output.text);
+            let tool_calls = std::mem::take(&mut output.tool_calls);
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
@@ -596,7 +617,8 @@ pub async fn call_chat_completions(
                     client.global_config().read().print_markdown(&text)?;
                 }
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            output.text = text;
+            Ok((output, eval_tool_calls(client.global_config(), tool_calls)?))
         }
         Err(err) => Err(err),
     }
@@ -606,7 +628,7 @@ pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<(ChatCompletionsOutput, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 
@@ -621,13 +643,22 @@ pub async fn call_chat_completions_streaming(
 
     render_ret?;
 
-    let (text, tool_calls) = handler.take();
+    let (text, tool_calls, usage) = handler.take();
     match send_ret {
         Ok(_) => {
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok((
+                ChatCompletionsOutput {
+                    text,
+                    tool_calls: Vec::new(),
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    ..Default::default()
+                },
+                eval_tool_calls(client.global_config(), tool_calls)?,
+            ))
         }
         Err(err) => {
             if !text.is_empty() {
@@ -1013,5 +1044,26 @@ mod tests {
     #[test]
     fn catch_error_keeps_successful_response_as_control() {
         assert!(catch_error(&json!({"code":529,"detail":"Overloaded"}), 200).is_ok());
+    }
+
+    #[test]
+    fn formats_provider_usage_and_catalog_cost() {
+        let mut model = Model::new("test", "priced");
+        model.data_mut().input_price = Some(2.0);
+        model.data_mut().output_price = Some(8.0);
+
+        assert_eq!(
+            format_usage_cost(&model, TokenUsage::new(Some(1_000), Some(250))),
+            "Tokens: 1000 input + 250 output | Estimated cost: $0.004000"
+        );
+    }
+
+    #[test]
+    fn reports_missing_usage_without_estimating_cost() {
+        let model = Model::new("test", "unpriced");
+        assert_eq!(
+            format_usage_cost(&model, TokenUsage::default()),
+            "Tokens: unavailable input + unavailable output | Estimated cost: unavailable"
+        );
     }
 }

@@ -106,6 +106,7 @@ pub struct Config {
     pub top_p: Option<f64>,
 
     pub dry_run: bool,
+    pub show_cost: bool,
     pub stream: bool,
     pub save: bool,
     pub keybindings: String,
@@ -187,6 +188,7 @@ impl Default for Config {
             top_p: None,
 
             dry_run: false,
+            show_cost: false,
             stream: true,
             save: false,
             keybindings: "emacs".into(),
@@ -606,6 +608,7 @@ impl Config {
             ),
             ("rag_top_k", rag_top_k.to_string()),
             ("dry_run", self.dry_run.to_string()),
+            ("show_cost", self.show_cost.to_string()),
             ("function_calling", self.function_calling.to_string()),
             ("stream", self.stream.to_string()),
             ("save", self.save.to_string()),
@@ -677,6 +680,10 @@ impl Config {
             "dry_run" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().dry_run = value;
+            }
+            "show_cost" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().show_cost = value;
             }
             "function_calling" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -1810,6 +1817,7 @@ impl Config {
                         "rag_top_k",
                         "max_output_tokens",
                         "dry_run",
+                        "show_cost",
                         "function_calling",
                         "stream",
                         "save",
@@ -1833,6 +1841,7 @@ impl Config {
                     None => vec![],
                 },
                 "dry_run" => complete_bool(self.dry_run),
+                "show_cost" => complete_bool(self.show_cost),
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
                 "function_calling" => complete_bool(self.function_calling),

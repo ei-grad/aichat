@@ -88,6 +88,7 @@ struct ClaudeStreamState {
     // stream that errors or is refused mid-flight never leaks partial output.
     buffered: Vec<ChatEvent>,
     terminal_stop_reason: Option<String>,
+    usage: TokenUsage,
 }
 
 impl ClaudeStreamState {
@@ -145,6 +146,9 @@ impl ClaudeStreamState {
         events.append(&mut self.buffered);
         for tool_call in std::mem::take(&mut self.completed_tool_calls) {
             events.push(ChatEvent::ToolCall(tool_call));
+        }
+        if !self.usage.is_empty() {
+            events.push(ChatEvent::Usage(self.usage));
         }
         Ok(())
     }
@@ -358,6 +362,12 @@ fn handle_claude_stream_message(
     };
 
     match typ {
+        "message_start" => {
+            state.usage.merge(TokenUsage::new(
+                data["message"]["usage"]["input_tokens"].as_u64(),
+                data["message"]["usage"]["output_tokens"].as_u64(),
+            ));
+        }
         "content_block_start" => {
             let block_type = data["content_block"]["type"]
                 .as_str()
@@ -443,6 +453,10 @@ fn handle_claude_stream_message(
             state.finish_block(index)?;
         }
         "message_delta" => {
+            state.usage.merge(TokenUsage::new(
+                data["usage"]["input_tokens"].as_u64(),
+                data["usage"]["output_tokens"].as_u64(),
+            ));
             if let Some(stop_reason) = data["delta"].get("stop_reason") {
                 if stop_reason.is_null() {
                     return Ok(false);
@@ -509,6 +523,7 @@ pub fn claude_build_chat_completions_body(
         top_p,
         functions,
         stream,
+        include_usage: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -739,6 +754,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            include_usage: false,
         }
     }
 
@@ -1380,7 +1396,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -1417,7 +1433,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -1451,7 +1467,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -1492,7 +1508,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -1531,7 +1547,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -1593,11 +1609,38 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "side_effect");
         assert_eq!(calls[0].arguments, json!({}));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_usage_merges_message_start_and_delta() -> Result<()> {
+        let mut events = Vec::new();
+        let mut state = ClaudeStreamState::default();
+
+        handle_value(
+            &mut state,
+            &mut events,
+            json!({"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}),
+        )?;
+        handle_value(
+            &mut state,
+            &mut events,
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+        )?;
+        assert!(handle_value(
+            &mut state,
+            &mut events,
+            json!({"type":"message_stop"}),
+        )?);
+        assert_eq!(
+            events,
+            [ChatEvent::Usage(TokenUsage::new(Some(12), Some(7)))]
+        );
         Ok(())
     }
 
@@ -1713,7 +1756,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "<think>\nreason\n</think>\n\nanswer");
         assert!(calls.is_empty());
         Ok(())
@@ -1745,7 +1788,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("claude", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "<think>\nreason\n</think>\n\n");
         assert!(calls.is_empty());
         Ok(())

@@ -211,6 +211,12 @@ pub async fn gemini_chat_events(
     let handle = |value: &str, events: &mut Vec<ChatEvent>| -> Result<()> {
         let data: Value = serde_json::from_str(value)?;
         debug!("stream-data: {data}");
+        if data.get("usageMetadata").is_some() {
+            events.push(ChatEvent::Usage(TokenUsage::new(
+                data["usageMetadata"]["promptTokenCount"].as_u64(),
+                data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+            )));
+        }
         if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
             for (i, part) in parts.iter().enumerate() {
                 if let Some(text) = part["text"].as_str() {
@@ -321,6 +327,7 @@ pub fn gemini_build_chat_completions_body(
         top_p,
         functions,
         stream: _,
+        include_usage: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -575,6 +582,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream,
+            include_usage: false,
         }
     }
 

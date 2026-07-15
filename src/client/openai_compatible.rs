@@ -290,6 +290,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            include_usage: false,
         }
     }
 

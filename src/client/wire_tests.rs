@@ -54,6 +54,12 @@ fn event_to_json(event: &ChatEvent) -> Value {
                 "id": call.id,
             }
         }),
+        ChatEvent::Usage(usage) => json!({
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            }
+        }),
     }
 }
 

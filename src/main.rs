@@ -14,11 +14,12 @@ extern crate log;
 
 use crate::cli::Cli;
 use crate::client::{
-    call_chat_completions, call_chat_completions_streaming, list_models, ModelType,
+    call_chat_completions, call_chat_completions_streaming, format_usage_cost, list_models,
+    ModelType, TokenUsage,
 };
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
-    WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
+    RoleLike, WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
 };
 use crate::render::render_error;
 use crate::repl::Repl;
@@ -98,6 +99,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
 
     if cli.dry_run {
         config.write().dry_run = true;
+    }
+    if cli.show_cost {
+        config.write().show_cost = true;
     }
 
     if let Some(agent) = &cli.agent {
@@ -201,6 +205,22 @@ async fn start_directive(
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<()> {
+    let model = input.role().model().clone();
+    let usage = run_directive(config, input, code_mode, abort_signal).await?;
+    if config.read().show_cost {
+        eprintln!("{}", format_usage_cost(&model, usage));
+    }
+    config.write().exit_session()?;
+    Ok(())
+}
+
+#[async_recursion::async_recursion]
+async fn run_directive(
+    config: &GlobalConfig,
+    input: Input,
+    code_mode: bool,
+    abort_signal: AbortSignal,
+) -> Result<TokenUsage> {
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
@@ -218,20 +238,21 @@ async fn start_directive(
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+        .after_chat_completion(&input, &output.text, &tool_results)?;
+
+    let mut usage = output.usage();
 
     if !tool_results.is_empty() {
-        start_directive(
+        let next_usage = run_directive(
             config,
-            input.merge_tool_results(output, tool_results),
+            input.merge_tool_results(output.text, tool_results),
             code_mode,
             abort_signal,
         )
         .await?;
+        usage.add(next_usage);
     }
-
-    config.write().exit_session()?;
-    Ok(())
+    Ok(usage)
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
@@ -248,17 +269,26 @@ async fn shell_execute(
 ) -> Result<()> {
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (eval_str, _) =
+    let (output, _) =
         call_chat_completions(&input, false, true, client.as_ref(), abort_signal.clone()).await?;
+    let usage = output.usage();
+    let eval_str = output.text;
 
     config
         .write()
         .after_chat_completion(&input, &eval_str, &[])?;
+    let usage_summary = config
+        .read()
+        .show_cost
+        .then(|| format_usage_cost(client.model(), usage));
     if eval_str.is_empty() {
         bail!("No command generated");
     }
     if config.read().dry_run {
         config.read().print_markdown(&eval_str)?;
+        if let Some(summary) = usage_summary {
+            eprintln!("{summary}");
+        }
         return Ok(());
     }
     if *IS_STDOUT_TERMINAL {
@@ -270,8 +300,12 @@ async fn shell_execute(
             .map(|v| format!("{}{}", color_text(&v[0..1], first_letter_color), &v[1..]))
             .collect::<Vec<String>>()
             .join(&dimmed_text(" | "));
+        let mut usage_summary = usage_summary;
         loop {
             println!("{command}");
+            if let Some(summary) = usage_summary.take() {
+                eprintln!("{summary}");
+            }
             let answer_char =
                 read_single_key(&['e', 'r', 'd', 'c', 'q'], 'e', &format!("{prompt_text}: "))?;
 
@@ -293,13 +327,13 @@ async fn shell_execute(
                 'd' => {
                     let role = config.read().retrieve_role(EXPLAIN_SHELL_ROLE)?;
                     let input = Input::from_str(config, &eval_str, Some(role));
-                    if input.stream() {
+                    let (description, _) = if input.stream() {
                         call_chat_completions_streaming(
                             &input,
                             client.as_ref(),
                             abort_signal.clone(),
                         )
-                        .await?;
+                        .await?
                     } else {
                         call_chat_completions(
                             &input,
@@ -308,7 +342,10 @@ async fn shell_execute(
                             client.as_ref(),
                             abort_signal.clone(),
                         )
-                        .await?;
+                        .await?
+                    };
+                    if config.read().show_cost {
+                        eprintln!("{}", format_usage_cost(client.model(), description.usage()));
                     }
                     println!();
                     continue;
@@ -323,6 +360,9 @@ async fn shell_execute(
         }
     } else {
         println!("{eval_str}");
+        if let Some(summary) = usage_summary {
+            eprintln!("{summary}");
+        }
     }
     Ok(())
 }

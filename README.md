@@ -64,6 +64,16 @@ Accept diverse input forms such as stdin, local files and directories, and remot
 | External commands | ```aichat -f '`git diff`'```         | ```.file `git diff` ```          |
 | Combine Inputs    | `aichat -f dir/ -f data.txt explain` | `.file dir/ data.txt -- explain` |
 
+### Token Usage and Cost
+
+Use `--show-cost` to print provider-reported token usage and the estimated USD cost after a response:
+
+```sh
+aichat --show-cost "Explain this code"
+```
+
+Set `show_cost: true` in the config file to enable it by default, including in the REPL. The summary is written to stderr so response text on stdout remains safe to pipe. Cost requires both usage data from the provider and input/output prices in the model catalog.
+
 ### Role
 
 Customize roles to tailor LLM behavior, enhancing interaction efficiency and boosting productivity.

@@ -100,6 +100,7 @@ fn prepare_rerank(self_: &CohereClient, data: &RerankData) -> Result<RequestData
 pub fn cohere_build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Value {
     let mut body = openai_build_chat_completions_body(data, model);
     if let Some(obj) = body.as_object_mut() {
+        obj.remove("stream_options");
         if let Some(top_p) = obj.remove("top_p") {
             obj.insert("p".to_string(), top_p);
         }
@@ -267,6 +268,14 @@ fn handle_cohere_stream_message(
                 );
             }
             state.finish_message(events, "message-end")?;
+            let usage = &data["delta"]["usage"]["billed_units"];
+            let usage = TokenUsage::new(
+                usage["input_tokens"].as_u64(),
+                usage["output_tokens"].as_u64(),
+            );
+            if !usage.is_empty() {
+                events.push(ChatEvent::Usage(usage));
+            }
             return Ok(true);
         }
         _ => {}
@@ -431,6 +440,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            include_usage: false,
         }
     }
 
@@ -500,7 +510,10 @@ mod tests {
             &mut events,
             &json!({
                 "type":"message-end",
-                "delta":{"finish_reason":"COMPLETE"}
+                "delta":{
+                    "finish_reason":"COMPLETE",
+                    "usage":{"billed_units":{"input_tokens":12,"output_tokens":7}}
+                }
             })
             .to_string(),
         )?;
@@ -511,6 +524,7 @@ mod tests {
             [
                 ChatEvent::Text("plan ".into()),
                 ChatEvent::Text("hello".into()),
+                ChatEvent::Usage(TokenUsage::new(Some(12), Some(7))),
             ]
         );
         Ok(())
@@ -548,7 +562,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert_eq!(text, "hello");
         assert!(calls.is_empty());
         Ok(())
@@ -569,7 +583,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "side_effect");
@@ -595,7 +609,7 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
@@ -630,7 +644,7 @@ mod tests {
 
         stream_into_handler(builder, &mut handler, &Model::new("cohere", "test-model")).await?;
 
-        let (text, calls) = handler.take();
+        let (text, calls, _) = handler.take();
         assert!(text.is_empty());
         assert!(calls.is_empty());
         Ok(())
