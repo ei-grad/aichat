@@ -24,10 +24,46 @@ use tokio::sync::mpsc::unbounded_channel;
 const MODELS_YAML: &str = include_str!("../../models.yaml");
 
 pub static ALL_PROVIDER_MODELS: LazyLock<Vec<ProviderModels>> = LazyLock::new(|| {
-    Config::loal_models_override()
-        .ok()
-        .unwrap_or_else(|| serde_yaml::from_str(MODELS_YAML).unwrap())
+    let bundled = serde_yaml::from_str(MODELS_YAML).unwrap();
+    match Config::loal_models_override() {
+        Ok(synced) => merge_provider_catalogs(bundled, synced),
+        Err(_) => bundled,
+    }
 });
+
+fn merge_provider_catalogs(
+    mut bundled: Vec<ProviderModels>,
+    synced: Vec<ProviderModels>,
+) -> Vec<ProviderModels> {
+    for mut synced_provider in synced {
+        let Some(bundled_provider) = bundled
+            .iter_mut()
+            .find(|provider| provider.provider == synced_provider.provider)
+        else {
+            bundled.push(synced_provider);
+            continue;
+        };
+        if synced_provider.api_base.is_some() {
+            bundled_provider.api_base = synced_provider.api_base.take();
+        }
+        if synced_provider.wire_format != WireFormat::default() {
+            bundled_provider.wire_format = synced_provider.wire_format;
+        }
+        for synced_model in synced_provider.models {
+            if let Some(index) = bundled_provider
+                .models
+                .iter()
+                .position(|model| model.name == synced_model.name)
+            {
+                bundled_provider.models[index] =
+                    synced_model.with_catalog_metadata_defaults(&bundled_provider.models[index]);
+            } else {
+                bundled_provider.models.push(synced_model);
+            }
+        }
+    }
+    bundled
+}
 
 /// Catalog endpoint of a provider served by the generic `openai-compatible`
 /// client, or `None` for unknown/native providers.
@@ -321,43 +357,33 @@ pub trait Client: Sync + Send {
     fn request_builder(
         &self,
         client: &reqwest::Client,
-        mut request_data: RequestData,
+        request_data: RequestData,
     ) -> RequestBuilder {
-        self.patch_request_data(&mut request_data);
+        self.request_builder_for_api(client, request_data, self.model().model_type().into())
+    }
+
+    fn request_builder_for_api(
+        &self,
+        client: &reqwest::Client,
+        mut request_data: RequestData,
+        api: RequestApi,
+    ) -> RequestBuilder {
+        self.patch_request_data_for_api(&mut request_data, api);
         request_data.into_builder(client)
     }
 
     fn patch_request_data(&self, request_data: &mut RequestData) {
-        let model_type = self.model().model_type();
-        if let Some(patch) = self.model().patch() {
-            request_data.apply_patch(patch.clone());
-        }
+        self.patch_request_data_for_api(request_data, self.model().model_type().into());
+    }
 
-        let patch_map = std::env::var(get_env_name(&format!(
-            "patch_{}_{}",
-            self.model().client_name(),
-            model_type.api_name(),
-        )))
-        .ok()
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .or_else(|| {
-            self.patch_config()
-                .and_then(|v| model_type.extract_patch(v))
-                .cloned()
-        });
-        let patch_map = match patch_map {
-            Some(v) => v,
-            _ => return,
-        };
-        for (key, patch) in patch_map {
-            let key = ESCAPE_SLASH_RE.replace_all(&key, r"\/");
-            if let Ok(regex) = Regex::new(&format!("^({key})$")) {
-                if let Ok(true) = regex.is_match(self.model().name()) {
-                    request_data.apply_patch(patch);
-                    return;
-                }
-            }
-        }
+    fn patch_request_data_for_api(&self, request_data: &mut RequestData, api: RequestApi) {
+        apply_request_patches(
+            self.model(),
+            self.patch_config(),
+            request_data,
+            api,
+            |name| std::env::var(name).ok(),
+        );
     }
 }
 
@@ -378,9 +404,92 @@ pub struct RequestPatch {
     pub chat_completions: Option<ApiPatch>,
     pub embeddings: Option<ApiPatch>,
     pub rerank: Option<ApiPatch>,
+    pub responses: Option<ApiPatch>,
 }
 
 pub type ApiPatch = IndexMap<String, Value>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestApi {
+    ChatCompletions,
+    Embeddings,
+    Rerank,
+    Responses,
+}
+
+impl RequestApi {
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => ModelType::Chat.api_name(),
+            Self::Embeddings => ModelType::Embedding.api_name(),
+            Self::Rerank => ModelType::Reranker.api_name(),
+            Self::Responses => "responses",
+        }
+    }
+
+    fn extract_patch(self, patch: &RequestPatch) -> Option<&ApiPatch> {
+        match self {
+            Self::ChatCompletions => ModelType::Chat.extract_patch(patch),
+            Self::Embeddings => ModelType::Embedding.extract_patch(patch),
+            Self::Rerank => ModelType::Reranker.extract_patch(patch),
+            Self::Responses => patch.responses.as_ref(),
+        }
+    }
+
+    fn applies_model_patch(self) -> bool {
+        !matches!(self, Self::Responses)
+    }
+}
+
+impl From<ModelType> for RequestApi {
+    fn from(model_type: ModelType) -> Self {
+        match model_type {
+            ModelType::Chat => Self::ChatCompletions,
+            ModelType::Embedding => Self::Embeddings,
+            ModelType::Reranker => Self::Rerank,
+        }
+    }
+}
+
+fn request_patch_env_name(client_name: &str, api: RequestApi) -> String {
+    get_env_name(&format!("patch_{client_name}_{}", api.api_name()))
+}
+
+fn apply_request_patches<F>(
+    model: &Model,
+    patch_config: Option<&RequestPatch>,
+    request_data: &mut RequestData,
+    api: RequestApi,
+    env_lookup: F,
+) where
+    F: Fn(&str) -> Option<String>,
+{
+    if api.applies_model_patch() {
+        if let Some(patch) = model.patch() {
+            request_data.apply_patch(patch.clone());
+        }
+    }
+
+    let patch_map = env_lookup(&request_patch_env_name(model.client_name(), api))
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .or_else(|| {
+            patch_config
+                .and_then(|patch| api.extract_patch(patch))
+                .cloned()
+        });
+    let Some(patch_map) = patch_map else {
+        return;
+    };
+    for (key, patch) in patch_map {
+        let key = ESCAPE_SLASH_RE.replace_all(&key, r"\/");
+        if let Ok(regex) = Regex::new(&format!("^({key})$")) {
+            if let Ok(true) = regex.is_match(model.name()) {
+                request_data.apply_patch(patch);
+                return;
+            }
+        }
+    }
+}
 
 pub struct RequestData {
     pub url: String,
@@ -892,6 +1001,105 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn api_patch(model_pattern: &str, patch: Value) -> ApiPatch {
+        IndexMap::from([(model_pattern.to_string(), patch)])
+    }
+
+    #[test]
+    fn synced_catalog_overlays_without_removing_bundled_fork_models() {
+        let bundled: Vec<ProviderModels> = serde_yaml::from_str(
+            r#"
+- provider: openai
+  models:
+    - name: gpt-existing
+      max_input_tokens: 4096
+      input_price: 1
+      output_price: 3
+      patch:
+        body:
+          bundled: true
+      max_output_tokens: 1024
+      require_max_tokens: true
+      supports_vision: true
+      supports_function_calling: true
+      system_prompt_prefix: bundled
+      max_tokens_per_chunk: 512
+      default_chunk_size: 256
+      max_batch_size: 8
+    - name: gpt-5.6-sol
+      reasoning_efforts: [high]
+      response_pricing:
+        cached_input_price: 0.5
+        cache_write_input_price: 6.25
+        web_search_call_price: 0.01
+        long_context_threshold: 272000
+        long_context_input_multiplier: 2
+        long_context_output_multiplier: 1.5
+        service_tier_multipliers:
+          default: 1
+"#,
+        )
+        .unwrap();
+        let synced: Vec<ProviderModels> = serde_yaml::from_str(
+            r#"
+- provider: openai
+  models:
+    - name: gpt-existing
+      input_price: 2
+    - name: gpt-new
+    - name: gpt-5.6-sol
+      reasoning_efforts: []
+"#,
+        )
+        .unwrap();
+
+        let merged = merge_provider_catalogs(bundled, synced);
+        let openai = &merged[0];
+
+        assert_eq!(
+            openai
+                .models
+                .iter()
+                .find(|model| model.name == "gpt-existing")
+                .and_then(|model| model.input_price),
+            Some(2.0)
+        );
+        let existing = openai
+            .models
+            .iter()
+            .find(|model| model.name == "gpt-existing")
+            .unwrap();
+        assert_eq!(existing.max_input_tokens, None);
+        assert_eq!(existing.output_price, None);
+        assert_eq!(existing.patch, None);
+        assert_eq!(existing.max_output_tokens, None);
+        assert!(!existing.require_max_tokens);
+        assert!(!existing.supports_vision);
+        assert!(!existing.supports_function_calling);
+        assert_eq!(existing.max_tokens_per_chunk, None);
+        assert_eq!(existing.default_chunk_size, None);
+        assert_eq!(existing.max_batch_size, None);
+        let serialized = serde_yaml::to_value(existing).unwrap();
+        assert!(serialized.get("system_prompt_prefix").is_none());
+        assert!(openai.models.iter().any(|model| model.name == "gpt-new"));
+        assert!(openai
+            .models
+            .iter()
+            .any(|model| model.name == "gpt-5.6-sol"));
+        let sol = openai
+            .models
+            .iter()
+            .find(|model| model.name == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.reasoning_efforts, ["high"]);
+        assert_eq!(
+            sol.response_pricing
+                .as_ref()
+                .and_then(|pricing| pricing.web_search_call_price),
+            Some(0.01)
+        );
+    }
+
     fn resolve_with_env(
         client_name: &str,
         field_name: &str,
@@ -1031,6 +1239,136 @@ mod tests {
         ] {
             assert!(optional_config_field(resolved).is_err());
         }
+    }
+
+    #[test]
+    fn request_patch_deserializes_responses_endpoint() {
+        let patch: RequestPatch = serde_yaml::from_str(
+            r#"
+responses:
+  gpt-test:
+    body:
+      tools:
+        - type: web_search
+"#,
+        )
+        .expect("responses patch must deserialize");
+
+        assert_eq!(
+            patch.responses,
+            Some(api_patch(
+                "gpt-test",
+                json!({"body": {"tools": [{"type": "web_search"}]}}),
+            ))
+        );
+    }
+
+    #[test]
+    fn responses_patch_skips_chat_model_patch() {
+        let mut model = Model::new("openai", "gpt-test");
+        model.data_mut().patch = Some(json!({
+            "body": {"reasoning_effort": "high"},
+            "headers": {"x-model-patch": "applied"},
+        }));
+        let patch = RequestPatch {
+            responses: Some(api_patch(
+                "gpt-test",
+                json!({
+                    "body": {"tools": [{"type": "web_search"}]},
+                    "headers": {"x-responses-patch": "applied"},
+                }),
+            )),
+            ..Default::default()
+        };
+        let mut request = RequestData::new("https://example.invalid", json!({"model": "gpt-test"}));
+
+        apply_request_patches(
+            &model,
+            Some(&patch),
+            &mut request,
+            RequestApi::Responses,
+            |_| None,
+        );
+
+        assert_eq!(
+            request.body,
+            json!({"model": "gpt-test", "tools": [{"type": "web_search"}]})
+        );
+        assert_eq!(
+            request.headers.get("x-responses-patch").map(String::as_str),
+            Some("applied")
+        );
+        assert!(!request.headers.contains_key("x-model-patch"));
+    }
+
+    #[test]
+    fn responses_env_patch_uses_endpoint_name_and_precedes_config() {
+        let model = Model::new("openai", "gpt-test");
+        let patch = RequestPatch {
+            responses: Some(api_patch(
+                "gpt-test",
+                json!({"body": {"patch_source": "config"}}),
+            )),
+            ..Default::default()
+        };
+        let mut request = RequestData::new("https://example.invalid", json!({}));
+
+        apply_request_patches(
+            &model,
+            Some(&patch),
+            &mut request,
+            RequestApi::Responses,
+            |name| {
+                assert_eq!(name, "AICHAT_PATCH_OPENAI_RESPONSES");
+                Some(r#"{"gpt-test":{"body":{"patch_source":"env"}}}"#.into())
+            },
+        );
+
+        assert_eq!(request.body, json!({"patch_source": "env"}));
+    }
+
+    #[test]
+    fn existing_request_apis_keep_model_and_endpoint_patches() {
+        let mut model = Model::new("openai", "gpt-test");
+        model.data_mut().patch = Some(json!({"body": {"model_patch": true}}));
+        let patch = RequestPatch {
+            chat_completions: Some(api_patch(
+                "gpt-test",
+                json!({"body": {"endpoint": "chat_completions"}}),
+            )),
+            embeddings: Some(api_patch(
+                "gpt-test",
+                json!({"body": {"endpoint": "embeddings"}}),
+            )),
+            rerank: Some(api_patch(
+                "gpt-test",
+                json!({"body": {"endpoint": "rerank"}}),
+            )),
+            ..Default::default()
+        };
+
+        for (api, endpoint) in [
+            (RequestApi::ChatCompletions, "chat_completions"),
+            (RequestApi::Embeddings, "embeddings"),
+            (RequestApi::Rerank, "rerank"),
+        ] {
+            let mut request = RequestData::new("https://example.invalid", json!({}));
+            apply_request_patches(&model, Some(&patch), &mut request, api, |_| None);
+            assert_eq!(
+                request.body,
+                json!({"model_patch": true, "endpoint": endpoint})
+            );
+        }
+
+        assert_eq!(
+            RequestApi::from(ModelType::Chat),
+            RequestApi::ChatCompletions
+        );
+        assert_eq!(
+            RequestApi::from(ModelType::Embedding),
+            RequestApi::Embeddings
+        );
+        assert_eq!(RequestApi::from(ModelType::Reranker), RequestApi::Rerank);
     }
 
     #[test]

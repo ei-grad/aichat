@@ -24,6 +24,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use simplelog::LevelFilter;
@@ -34,6 +35,7 @@ use std::{
         create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
     },
     io::Write,
+    net::IpAddr,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process,
@@ -67,7 +69,7 @@ const CLIENTS_FIELD: &str = "clients";
 const SERVE_ADDR: &str = "127.0.0.1:8000";
 
 const SYNC_MODELS_URL: &str =
-    "https://raw.githubusercontent.com/sigoden/aichat/refs/heads/main/models.yaml";
+    "https://raw.githubusercontent.com/ei-grad/aichat/refs/heads/main/models.yaml";
 
 const SUMMARIZE_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
@@ -97,12 +99,297 @@ const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_to
 
 static EDITOR: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
+const MAX_WEB_SEARCH_DOMAINS: usize = 100;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchContextSize {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl WebSearchContextSize {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchReturnTokenBudget {
+    #[default]
+    Default,
+    Unlimited,
+}
+
+impl WebSearchReturnTokenBudget {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Unlimited => "unlimited",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSearchFilters {
+    #[serde(default, deserialize_with = "deserialize_allowed_domains")]
+    pub allowed_domains: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_blocked_domains")]
+    pub blocked_domains: Vec<String>,
+}
+
+impl WebSearchFilters {
+    pub fn validate(&self) -> Result<()> {
+        validate_domain_list(&self.allowed_domains, "allowed_domains")?;
+        validate_domain_list(&self.blocked_domains, "blocked_domains")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostedWebSearchConfig {
+    pub search_context_size: WebSearchContextSize,
+    pub external_web_access: Option<bool>,
+    pub return_token_budget: WebSearchReturnTokenBudget,
+    pub filters: Option<WebSearchFilters>,
+}
+
+impl HostedWebSearchConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(filters) = &self.filters {
+            filters.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MultiAgentHostedTool {
+    WebSearch {
+        #[serde(flatten)]
+        config: HostedWebSearchConfig,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum MultiAgentHostedToolWire {
+    WebSearch {
+        #[serde(default)]
+        search_context_size: WebSearchContextSize,
+        #[serde(default)]
+        external_web_access: Option<bool>,
+        #[serde(default)]
+        return_token_budget: WebSearchReturnTokenBudget,
+        #[serde(default)]
+        filters: Option<WebSearchFilters>,
+    },
+}
+
+impl<'de> Deserialize<'de> for MultiAgentHostedTool {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match MultiAgentHostedToolWire::deserialize(deserializer)? {
+            MultiAgentHostedToolWire::WebSearch {
+                search_context_size,
+                external_web_access,
+                return_token_budget,
+                filters,
+            } => Ok(Self::WebSearch {
+                config: HostedWebSearchConfig {
+                    search_context_size,
+                    external_web_access,
+                    return_token_budget,
+                    filters,
+                },
+            }),
+        }
+    }
+}
+
+impl MultiAgentHostedTool {
+    pub fn web_search() -> Self {
+        Self::WebSearch {
+            config: HostedWebSearchConfig::default(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::WebSearch { config } => config.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiAgentToolChoice {
+    #[default]
+    Auto,
+    Required,
+}
+
+impl MultiAgentToolChoice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum OpenAIServiceTier {
+    #[default]
+    Auto,
+    Default,
+    Flex,
+    Priority,
+}
+
+impl OpenAIServiceTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Priority => "priority",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct MultiAgentConfig {
     pub enabled: bool,
     pub max_concurrent_subagents: Option<NonZeroUsize>,
     pub show_trace: bool,
+    pub hosted_tools: Vec<MultiAgentHostedTool>,
+    pub tool_choice: MultiAgentToolChoice,
+    pub max_output_tokens: Option<NonZeroUsize>,
+    pub service_tier: OpenAIServiceTier,
+}
+
+impl MultiAgentConfig {
+    pub fn validate(&self) -> Result<()> {
+        for tool in &self.hosted_tools {
+            tool.validate()?;
+        }
+        let web_search_count = self
+            .hosted_tools
+            .iter()
+            .filter(|tool| matches!(tool, MultiAgentHostedTool::WebSearch { .. }))
+            .count();
+        if web_search_count > 1 {
+            bail!("multi_agent.hosted_tools may contain web_search at most once");
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_allowed_domains<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_domain_list(deserializer, "allowed_domains")
+}
+
+fn deserialize_blocked_domains<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_domain_list(deserializer, "blocked_domains")
+}
+
+fn deserialize_domain_list<'de, D>(
+    deserializer: D,
+    field_name: &str,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let domains = Vec::<String>::deserialize(deserializer)?;
+    validate_domain_list(&domains, field_name).map_err(serde::de::Error::custom)?;
+    Ok(domains)
+}
+
+fn validate_domain_list(domains: &[String], field_name: &str) -> Result<()> {
+    if domains.len() > MAX_WEB_SEARCH_DOMAINS {
+        bail!(
+            "multi_agent web_search {field_name} accepts at most {MAX_WEB_SEARCH_DOMAINS} domains"
+        );
+    }
+
+    for (index, domain) in domains.iter().enumerate() {
+        if domain.is_empty() {
+            bail!("multi_agent web_search {field_name}[{index}] must not be empty");
+        }
+        if domain.chars().any(char::is_whitespace) {
+            bail!("multi_agent web_search {field_name}[{index}] must not contain whitespace");
+        }
+        if domain.contains("://") {
+            bail!("multi_agent web_search {field_name}[{index}] must not include a URL scheme");
+        }
+        if !is_web_search_domain(domain) {
+            bail!(
+                "multi_agent web_search {field_name}[{index}] must be a domain without a scheme, path, port, query, or fragment"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_web_search_domain(domain: &str) -> bool {
+    if domain
+        .chars()
+        .any(|character| matches!(character, '/' | '?' | '#' | '@' | ':'))
+    {
+        return false;
+    }
+    let Ok(url) = Url::parse(&format!("https://{domain}")) else {
+        return false;
+    };
+    if url.port().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2812,6 +3099,10 @@ mod tests {
         assert!(!config.multi_agent.enabled);
         assert_eq!(config.multi_agent.max_concurrent_subagents, None);
         assert!(!config.multi_agent.show_trace);
+        assert!(config.multi_agent.hosted_tools.is_empty());
+        assert_eq!(config.multi_agent.tool_choice, MultiAgentToolChoice::Auto);
+        assert_eq!(config.multi_agent.max_output_tokens, None);
+        assert_eq!(config.multi_agent.service_tier, OpenAIServiceTier::Auto);
     }
 
     #[test]
@@ -2839,6 +3130,149 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_agent_config_deserializes_hosted_web_search() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+multi_agent:
+  enabled: true
+  hosted_tools:
+    - type: web_search
+      search_context_size: high
+      external_web_access: false
+      return_token_budget: unlimited
+      filters:
+        allowed_domains:
+          - docs.example.com
+        blocked_domains:
+          - private.example.com
+  tool_choice: required
+  max_output_tokens: 4096
+  service_tier: flex
+"#,
+        )
+        .unwrap();
+
+        assert!(config.multi_agent.enabled);
+        assert_eq!(
+            config.multi_agent.tool_choice,
+            MultiAgentToolChoice::Required
+        );
+        assert_eq!(
+            config.multi_agent.max_output_tokens.map(NonZeroUsize::get),
+            Some(4096)
+        );
+        assert_eq!(config.multi_agent.service_tier, OpenAIServiceTier::Flex);
+        assert_eq!(config.multi_agent.hosted_tools.len(), 1);
+
+        let MultiAgentHostedTool::WebSearch { config: web_search } =
+            &config.multi_agent.hosted_tools[0];
+        assert_eq!(web_search.search_context_size, WebSearchContextSize::High);
+        assert_eq!(web_search.external_web_access, Some(false));
+        assert_eq!(
+            web_search.return_token_budget,
+            WebSearchReturnTokenBudget::Unlimited
+        );
+        let filters = web_search.filters.as_ref().unwrap();
+        assert_eq!(filters.allowed_domains, ["docs.example.com"]);
+        assert_eq!(filters.blocked_domains, ["private.example.com"]);
+        config.multi_agent.validate().unwrap();
+
+        let value = serde_yaml::to_value(&config.multi_agent).unwrap();
+        assert_eq!(value["hosted_tools"][0]["type"], "web_search");
+    }
+
+    #[test]
+    fn multi_agent_config_rejects_zero_request_limits() {
+        assert!(serde_yaml::from_str::<Config>("multi_agent:\n  max_output_tokens: 0\n").is_err());
+    }
+
+    #[test]
+    fn multi_agent_config_rejects_unknown_hosted_tool_values() {
+        for yaml in [
+            "multi_agent:\n  tool_choice: forced\n",
+            "multi_agent:\n  service_tier: batch\n",
+            "multi_agent:\n  hosted_tools:\n    - type: web_search\n      search_context_size: huge\n",
+            "multi_agent:\n  hosted_tools:\n    - type: web_search\n      return_token_budget: tiny\n",
+        ] {
+            assert!(serde_yaml::from_str::<Config>(yaml).is_err(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn multi_agent_config_rejects_unknown_fields() {
+        for yaml in [
+            "multi_agent:\n  max_tool_calls: 3\n",
+            "multi_agent:\n  hosted_tools:\n    - type: web_search\n      external_web_acess: false\n",
+            "multi_agent:\n  hosted_tools:\n    - type: web_search\n      filters:\n        allowed_domain: [example.com]\n",
+        ] {
+            assert!(serde_yaml::from_str::<Config>(yaml).is_err(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn multi_agent_config_rejects_duplicate_web_search_tools() {
+        let config: Config = serde_yaml::from_str(
+            "multi_agent:\n  hosted_tools:\n    - type: web_search\n    - type: web_search\n",
+        )
+        .unwrap();
+
+        assert!(config
+            .multi_agent
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("at most once"));
+    }
+
+    #[test]
+    fn multi_agent_web_search_rejects_invalid_domains() {
+        for domain in [
+            "''",
+            "'two words.example'",
+            "https://example.com",
+            "'https:example.com'",
+            "'example.com/path'",
+            "'example.com?x=1'",
+            "'example.com:443'",
+            "'127.0.0.1'",
+        ] {
+            let yaml = format!(
+                "multi_agent:\n  hosted_tools:\n    - type: web_search\n      filters:\n        allowed_domains:\n          - {domain}\n"
+            );
+            assert!(serde_yaml::from_str::<Config>(&yaml).is_err(), "{domain}");
+        }
+    }
+
+    #[test]
+    fn multi_agent_web_search_accepts_host_only_domains() {
+        for domain in ["example.com", "sub.example.co.uk", "xn--bcher-kva.example"] {
+            let yaml = format!(
+                "multi_agent:\n  hosted_tools:\n    - type: web_search\n      filters:\n        allowed_domains:\n          - {domain}\n"
+            );
+            assert!(serde_yaml::from_str::<Config>(&yaml).is_ok(), "{domain}");
+        }
+    }
+
+    #[test]
+    fn multi_agent_web_search_limits_each_domain_filter_to_one_hundred() {
+        for field in ["allowed_domains", "blocked_domains"] {
+            for (count, should_succeed) in [(100, true), (101, false)] {
+                let domains = (0..count)
+                    .map(|index| format!("          - d{index}.example\n"))
+                    .collect::<String>();
+                let yaml = format!(
+                    "multi_agent:\n  hosted_tools:\n    - type: web_search\n      filters:\n        {field}:\n{domains}"
+                );
+                assert_eq!(
+                    serde_yaml::from_str::<Config>(&yaml).is_ok(),
+                    should_succeed,
+                    "{field} with {count} entries"
+                );
+            }
+        }
     }
 
     #[test]

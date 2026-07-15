@@ -12,13 +12,16 @@ pub use super::openai::OpenAIConfig;
 pub use super::openai_compatible::OpenAICompatibleConfig;
 pub use super::vertexai::VertexAIConfig;
 use super::{
-    create_config, create_openai_compatible_client_config, Client, Model, ModelData, ModelType,
-    ALL_PROVIDER_MODELS,
+    create_config, create_openai_compatible_client_config, optional_config_field,
+    resolve_config_field, Client, Model, ModelData, ModelType, ALL_PROVIDER_MODELS,
 };
 use crate::config::{Config, GlobalConfig};
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
+use std::collections::HashSet;
+
+const CANONICAL_OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -89,6 +92,33 @@ fn client_config_name(client_config: &ClientConfig) -> Option<&str> {
         ClientConfig::BedrockConfig(c) => Some(BedrockClient::name(c)),
         ClientConfig::Unknown => None,
     }
+}
+
+fn is_canonical_openai_api_base(api_base: &str) -> bool {
+    api_base.trim_end_matches('/') == CANONICAL_OPENAI_API_BASE
+}
+
+fn uses_public_openai_catalog(config: &OpenAIConfig) -> bool {
+    match optional_config_field(resolve_config_field(
+        OpenAIClient::name(config),
+        "api_base",
+        config.api_base.as_deref(),
+        &[],
+    )) {
+        Ok(None) => true,
+        Ok(Some(api_base)) => is_canonical_openai_api_base(&api_base),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn client_allows_raw_reasoning_suffix(config: &Config, client_name: &str) -> bool {
+    config.clients.iter().any(|client_config| {
+        matches!(
+            client_config,
+            ClientConfig::OpenAICompatibleConfig(client)
+                if OpenAICompatibleClient::name(client) == client_name
+        )
+    })
 }
 
 pub fn init_client(config: &GlobalConfig, model: Option<Model>) -> Result<Box<dyn Client>> {
@@ -238,48 +268,56 @@ pub fn list_all_models(config: &Config) -> Vec<&Model> {
                         OpenAIClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        uses_public_openai_catalog(c),
                     ),
                     ClientConfig::OpenAICompatibleConfig(c) => provider_models(
                         OpenAICompatibleClient::name(c),
                         OpenAICompatibleClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::GeminiConfig(c) => provider_models(
                         GeminiClient::name(c),
                         GeminiClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::ClaudeConfig(c) => provider_models(
                         ClaudeClient::name(c),
                         ClaudeClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::CohereConfig(c) => provider_models(
                         CohereClient::name(c),
                         CohereClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::AzureOpenAIConfig(c) => provider_models(
                         AzureOpenAIClient::name(c),
                         AzureOpenAIClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::VertexAIConfig(c) => provider_models(
                         VertexAIClient::name(c),
                         VertexAIClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::BedrockConfig(c) => provider_models(
                         BedrockClient::name(c),
                         BedrockClient::NAME,
                         c.name.as_deref(),
                         &c.models,
+                        true,
                     ),
                     ClientConfig::Unknown => vec![],
                 })
@@ -296,26 +334,255 @@ pub fn list_models(config: &Config, model_type: ModelType) -> Vec<&Model> {
         .collect()
 }
 
-/// Models for one configured client: explicitly configured models win,
-/// otherwise the bundled catalog is consulted — by client type, and for
-/// `openai-compatible` entries by the custom name's provider prefix.
+/// Models for one configured client. Native OpenAI entries overlay the bundled
+/// catalog only at the canonical public endpoint. Local overrides win without
+/// hiding newly cataloged models or reasoning variants there; custom endpoints
+/// and other clients keep replacement semantics for explicit model lists.
 fn provider_models(
     client_name: &str,
     client_kind: &str,
     custom_name: Option<&str>,
     models: &[ModelData],
+    use_public_openai_catalog: bool,
 ) -> Vec<Model> {
-    if !models.is_empty() {
+    let provider = use_public_openai_catalog.then(|| {
+        ALL_PROVIDER_MODELS.iter().find(|v| {
+            v.provider == client_kind
+                || (client_kind == OpenAICompatibleClient::NAME
+                    && custom_name
+                        .map(|name| name.starts_with(&v.provider))
+                        .unwrap_or_default())
+        })
+    });
+    let provider = provider.flatten();
+    if models.is_empty() {
+        return provider
+            .map(|provider| Model::from_config(client_name, client_kind, &provider.models))
+            .unwrap_or_default();
+    }
+
+    if client_kind != OpenAIClient::NAME {
         return Model::from_config(client_name, client_kind, models);
     }
-    if let Some(provider) = ALL_PROVIDER_MODELS.iter().find(|v| {
-        v.provider == client_kind
-            || (client_kind == OpenAICompatibleClient::NAME
-                && custom_name
-                    .map(|name| name.starts_with(&v.provider))
-                    .unwrap_or_default())
-    }) {
-        return Model::from_config(client_name, client_kind, &provider.models);
+    let Some(provider) = provider else {
+        return Model::from_config(client_name, client_kind, models);
+    };
+    let effective_models = models
+        .iter()
+        .map(|configured| {
+            provider
+                .models
+                .iter()
+                .find(|catalog| catalog.name == configured.name)
+                .map(|catalog| configured.with_catalog_capabilities(catalog))
+                .unwrap_or_else(|| configured.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut configured = Model::from_config(client_name, client_kind, &effective_models);
+    let mut configured_ids = configured
+        .iter()
+        .map(|model| model.id())
+        .collect::<HashSet<_>>();
+    for model in Model::from_config(client_name, client_kind, &provider.models) {
+        if configured_ids.insert(model.id()) {
+            configured.push(model);
+        }
     }
-    vec![]
+    configured
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_openai_catalog_exposes_sol_high_without_explicit_models() {
+        let config = Config {
+            clients: vec![ClientConfig::OpenAIConfig(OpenAIConfig::default())],
+            ..Default::default()
+        };
+        let models = list_models(&config, ModelType::Chat);
+
+        assert!(models
+            .iter()
+            .any(|model| model.id() == "openai:gpt-5.6-sol:high"));
+    }
+
+    #[test]
+    fn native_openai_name_only_entry_inherits_catalog_pricing_and_efforts() {
+        let configured = ModelData::new("gpt-5.6-sol");
+        let models = provider_models(
+            "openai",
+            OpenAIClient::NAME,
+            None,
+            std::slice::from_ref(&configured),
+            true,
+        );
+        let high = models
+            .iter()
+            .find(|model| model.id() == "openai:gpt-5.6-sol:high")
+            .unwrap();
+
+        assert_eq!(high.data().input_price, Some(5.0));
+        assert_eq!(high.data().output_price, Some(30.0));
+        assert_eq!(
+            high.data()
+                .response_pricing
+                .as_ref()
+                .and_then(|pricing| pricing.web_search_call_price),
+            Some(0.01)
+        );
+    }
+
+    #[test]
+    fn native_openai_explicit_models_overlay_instead_of_hiding_catalog_variants() {
+        let mut configured = ModelData::new("gpt-5.6-sol");
+        configured.input_price = Some(42.0);
+        configured.patch = Some(serde_json::json!({"body": {"custom": true}}));
+        let models = provider_models(
+            "openai",
+            OpenAIClient::NAME,
+            None,
+            std::slice::from_ref(&configured),
+            true,
+        );
+
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.id() == "openai:gpt-5.6-sol")
+                .count(),
+            1
+        );
+        assert!(models
+            .iter()
+            .any(|model| model.id() == "openai:gpt-5.6-sol:high"));
+        let base = models
+            .iter()
+            .find(|model| model.id() == "openai:gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(base.data().input_price, configured.input_price);
+        let high = models
+            .iter()
+            .find(|model| model.id() == "openai:gpt-5.6-sol:high")
+            .unwrap();
+        assert_eq!(high.data().input_price, configured.input_price);
+        assert_eq!(high.data().output_price, Some(30.0));
+        assert_eq!(
+            high.data()
+                .response_pricing
+                .as_ref()
+                .and_then(|pricing| pricing.web_search_call_price),
+            Some(0.01)
+        );
+        assert_eq!(high.real_name(), "gpt-5.6-sol");
+        assert_eq!(high.data().patch.as_ref().unwrap()["body"]["custom"], true);
+        assert_eq!(
+            high.data().patch.as_ref().unwrap()["body"]["reasoning_effort"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn native_openai_old_response_pricing_inherits_web_search_price() {
+        let defaults = ALL_PROVIDER_MODELS
+            .iter()
+            .find(|provider| provider.provider == "openai")
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.name == "gpt-5.6-sol")
+            })
+            .unwrap();
+        let mut configured = ModelData::new("gpt-5.6-sol");
+        let mut old_pricing = defaults.response_pricing.clone().unwrap();
+        old_pricing.cached_input_price = 99.0;
+        old_pricing.web_search_call_price = None;
+        configured.response_pricing = Some(old_pricing);
+
+        let merged = configured.with_catalog_defaults(defaults);
+        let pricing = merged.response_pricing.unwrap();
+
+        assert_eq!(pricing.cached_input_price, 99.0);
+        assert_eq!(pricing.web_search_call_price, Some(0.01));
+    }
+
+    #[test]
+    fn openai_compatible_explicit_models_keep_replacement_semantics() {
+        let configured = ModelData::new("private-model");
+        let models = provider_models(
+            "openai-proxy",
+            OpenAICompatibleClient::NAME,
+            Some("openai-proxy"),
+            std::slice::from_ref(&configured),
+            true,
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id(), "openai-proxy:private-model");
+    }
+
+    #[test]
+    fn canonical_openai_endpoint_normalizes_trailing_slashes() {
+        assert!(is_canonical_openai_api_base("https://api.openai.com/v1///"));
+        assert!(!is_canonical_openai_api_base(
+            "https://region.example.test/openai/v1"
+        ));
+    }
+
+    #[test]
+    fn custom_native_openai_endpoint_does_not_inherit_public_catalog() {
+        let configured = ModelData::new("gpt-5.6-sol");
+        let config = Config {
+            clients: vec![ClientConfig::OpenAIConfig(OpenAIConfig {
+                name: Some("regional-openai-catalog-test".into()),
+                api_key: None,
+                api_base: Some("https://region.example.test/openai/v1".into()),
+                organization_id: None,
+                models: vec![configured],
+                patch: None,
+                extra: None,
+            })],
+            ..Default::default()
+        };
+
+        let models = list_models(&config, ModelType::Chat);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id(), "regional-openai-catalog-test:gpt-5.6-sol");
+        assert_eq!(models[0].data().input_price, None);
+        assert_eq!(models[0].data().output_price, None);
+        assert_eq!(models[0].data().response_pricing, None);
+        assert!(models[0].data().reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn openai_compatible_uncataloged_effort_suffix_remains_literal() {
+        let config = Config {
+            clients: vec![ClientConfig::OpenAICompatibleConfig(
+                OpenAICompatibleConfig {
+                    name: Some("raw-reasoning-suffix-test".into()),
+                    api_base: Some("https://compatible.example.test/v1".into()),
+                    api_key: None,
+                    wire_format: None,
+                    models: vec![],
+                    patch: None,
+                    extra: None,
+                },
+            )],
+            ..Default::default()
+        };
+
+        let model = Model::retrieve_model(
+            &config,
+            "raw-reasoning-suffix-test:private-model:high",
+            ModelType::Chat,
+        )
+        .unwrap();
+
+        assert_eq!(model.id(), "raw-reasoning-suffix-test:private-model:high");
+        assert_eq!(model.real_name(), "private-model:high");
+        assert_eq!(model.reasoning_effort(), None);
+    }
 }

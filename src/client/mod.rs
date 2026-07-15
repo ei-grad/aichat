@@ -274,6 +274,13 @@ mod catalog_tests {
             err.to_string(),
             "Model 'claude:claude-fable-5' does not support reasoning effort 'none'. Supported efforts: low, medium, high, xhigh, max"
         );
+
+        let err = validate_reasoning_effort(&[], "openai", "missing-model:high")
+            .expect_err("an effort suffix without a cataloged base must fail locally");
+        assert_eq!(
+            err.to_string(),
+            "Model 'openai:missing-model' is not cataloged; configure its reasoning_efforts before using effort 'high'"
+        );
     }
 
     #[test]

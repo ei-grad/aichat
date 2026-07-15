@@ -1,21 +1,26 @@
 use super::registry::init_openai_client;
 use super::{
     catch_error, retry_request, ChatCompletionsData, ChatCompletionsOutput, Client, Message,
-    MessageContent, MessageContentPart, MessageRole, Model, TokenUsage, ToolCall,
+    MessageContent, MessageContentPart, MessageRole, Model, RequestApi, RequestData, TokenUsage,
+    ToolCall,
 };
 
-use crate::config::{GlobalConfig, Input, RoleLike};
+use crate::config::{
+    GlobalConfig, HostedWebSearchConfig, Input, MultiAgentConfig, MultiAgentHostedTool,
+    MultiAgentToolChoice, RoleLike,
+};
 use crate::function::{eval_tool_calls_preserving_results, FunctionDeclaration};
 use crate::utils::{strip_think_tag, wait_abort_signal, AbortSignal};
 
 use anyhow::{bail, Context, Result};
-use reqwest::{Client as ReqwestClient, RequestBuilder};
+use parking_lot::Mutex;
+use reqwest::{Client as ReqwestClient, RequestBuilder, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
-use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 const ROOT_AGENT: &str = "/root";
 const MULTI_AGENT_INSTRUCTIONS: &str = "Proactive multi-agent delegation is active. Use subagents when parallel work would materially improve speed or quality.";
@@ -24,38 +29,224 @@ const MAX_CONTINUATION_TURNS: usize = 64;
 pub async fn run_openai_responses_multi_agent(
     config: &GlobalConfig,
     input: &Input,
-    max_concurrent_subagents: Option<NonZeroUsize>,
     abort_signal: AbortSignal,
+    progress: OpenAIResponsesProgress,
 ) -> Result<OpenAIResponsesOutput> {
     let model = input.role().model().clone();
     validate_multi_agent_model(&model)?;
     let client = init_openai_client(config, &model)?;
+    let multi_agent = config.read().multi_agent.clone();
+    multi_agent.validate()?;
     let data = input.prepare_completion_data(&model, false)?;
-    let body = build_openai_responses_multi_agent_body(data, &model, max_concurrent_subagents)?;
+    let body = build_openai_responses_multi_agent_body(data, &model, &multi_agent)?;
+    let effective_request = prepare_openai_responses_request(&client, body.clone())?;
+    let pricing_context = responses_pricing_context(&effective_request, &model);
+    progress.set_pricing_context(pricing_context);
+
+    if !multi_agent.hosted_tools.is_empty()
+        && !is_public_openai_responses_endpoint(&effective_request)
+    {
+        bail!(
+            "OpenAI hosted tools require the canonical https://api.openai.com/v1/responses endpoint"
+        )
+    }
 
     if config.read().dry_run {
         return Ok(OpenAIResponsesOutput {
-            completion: ChatCompletionsOutput::new(&serde_json::to_string_pretty(&body)?),
+            completion: ChatCompletionsOutput::new(&serde_json::to_string_pretty(
+                &effective_request.body,
+            )?),
             turns: Vec::new(),
-            pricing_context: OpenAIResponsesPricingContext::UnknownApiBase,
+            citations: Vec::new(),
+            sources: Vec::new(),
+            pricing_context,
         });
     }
 
-    let pricing_context = if client.responses_uses_public_pricing()? {
-        OpenAIResponsesPricingContext::PublicApi
-    } else {
-        OpenAIResponsesPricingContext::UnknownApiBase
-    };
     let http = client.build_client()?;
-    let mut output = run_multi_agent_loop(
+    let mut output = run_multi_agent_loop_with_progress(
         body,
         &abort_signal,
         |body| send_openai_responses_turn(&client, &http, body),
         |calls| execute_function_calls(config, calls),
+        Some(&progress),
     )
     .await?;
     output.pricing_context = pricing_context;
     Ok(output)
+}
+
+#[cfg(test)]
+async fn run_multi_agent_loop<S, SFut, E>(
+    body: Value,
+    abort_signal: &AbortSignal,
+    send: S,
+    execute: E,
+) -> Result<OpenAIResponsesOutput>
+where
+    S: FnMut(Value) -> SFut,
+    SFut: Future<Output = Result<Value>>,
+    E: FnMut(Vec<OpenAIResponsesFunctionCall>) -> Result<Vec<Value>>,
+{
+    run_multi_agent_loop_with_progress(body, abort_signal, send, execute, None).await
+}
+
+async fn run_multi_agent_loop_with_progress<S, SFut, E>(
+    mut body: Value,
+    abort_signal: &AbortSignal,
+    mut send: S,
+    mut execute: E,
+    progress: Option<&OpenAIResponsesProgress>,
+) -> Result<OpenAIResponsesOutput>
+where
+    S: FnMut(Value) -> SFut,
+    SFut: Future<Output = Result<Value>>,
+    E: FnMut(Vec<OpenAIResponsesFunctionCall>) -> Result<Vec<Value>>,
+{
+    let mut input_items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("OpenAI Responses request input must be an array")?;
+    let mut cache: HashMap<String, CachedFunctionCall> = HashMap::new();
+    let mut cached_only_signatures = HashSet::new();
+    let mut total_usage: Option<TokenUsage> = None;
+    let mut turns = Vec::new();
+    let mut sources = Vec::new();
+
+    for _ in 0..MAX_CONTINUATION_TURNS {
+        let response = tokio::select! {
+            response = send(body.clone()) => response?,
+            _ = wait_abort_signal(abort_signal) => bail!("Aborted."),
+        };
+        let result = match parse_openai_responses_multi_agent(&response) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(progress) = progress {
+                    if let Some(turn) = observe_openai_responses_turn(&response) {
+                        progress.push_turn(turn);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        if body.get("tool_choice").and_then(Value::as_str) == Some("required") {
+            body["tool_choice"] = "auto".into();
+        }
+        total_usage = Some(match total_usage {
+            Some(mut total) => {
+                total.add(result.usage);
+                total
+            }
+            None => result.usage,
+        });
+        for call in &result.web_search_calls {
+            merge_sources(&mut sources, call.sources.iter().cloned());
+        }
+        let turn = OpenAIResponsesTurn {
+            response_id: result.response_id.clone(),
+            service_tier: result.service_tier.clone(),
+            usage: result.detailed_usage.clone(),
+            trace: result.trace.clone(),
+            web_search_calls: result.web_search_calls.clone(),
+        };
+        if let Some(progress) = progress {
+            progress.push_turn(turn.clone());
+        }
+        turns.push(turn);
+        input_items.extend(result.output_items.iter().cloned());
+
+        if result.function_calls.is_empty() {
+            let text = result.root_final_text.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Responses request '{}' completed without a root final answer",
+                    result.response_id
+                )
+            })?;
+            let usage = total_usage.unwrap_or_default();
+            let mut output = OpenAIResponsesOutput {
+                completion: ChatCompletionsOutput {
+                    text,
+                    id: Some(result.response_id),
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    ..Default::default()
+                },
+                turns,
+                citations: result.root_final_citations,
+                sources,
+                pricing_context: OpenAIResponsesPricingContext::UnknownApiBase,
+            };
+            merge_sources(
+                &mut output.sources,
+                output
+                    .citations
+                    .iter()
+                    .map(|citation| citation.source.clone()),
+            );
+            output.completion.text = append_sources_block(output.completion.text, &output.sources);
+            return Ok(output);
+        }
+        if abort_signal.aborted() {
+            bail!("Aborted.")
+        }
+
+        let mut new_calls = Vec::new();
+        let mut pending_by_call_id: HashMap<String, usize> = HashMap::new();
+        for call in &result.function_calls {
+            if let Some(cached) = cache.get(&call.call_id) {
+                validate_cached_call(call, cached)?;
+                continue;
+            }
+            if let Some(index) = pending_by_call_id.get(&call.call_id) {
+                validate_same_call(call, &new_calls[*index])?;
+                continue;
+            }
+            pending_by_call_id.insert(call.call_id.clone(), new_calls.len());
+            new_calls.push(call.clone());
+        }
+
+        if new_calls.is_empty() {
+            let signature = cached_call_signature(&result.function_calls)?;
+            if !cached_only_signatures.insert(signature) {
+                bail!(
+                    "OpenAI Responses multi-agent repeated the same cached function-call cycle without making progress"
+                )
+            }
+        } else {
+            cached_only_signatures.clear();
+            let outputs = execute(new_calls.clone())?;
+            if outputs.len() != new_calls.len() {
+                bail!(
+                    "Responses tool executor returned {} results for {} function calls",
+                    outputs.len(),
+                    new_calls.len()
+                )
+            }
+            for (call, output) in new_calls.into_iter().zip(outputs) {
+                cache.insert(
+                    call.call_id,
+                    CachedFunctionCall {
+                        name: call.name,
+                        arguments: call.arguments,
+                        output,
+                    },
+                );
+            }
+        }
+
+        for call in &result.function_calls {
+            let cached = cache
+                .get(&call.call_id)
+                .context("Responses function-call cache lost a completed result")?;
+            append_openai_function_call_output(&mut input_items, call, &cached.output);
+        }
+        body["input"] = Value::Array(input_items.clone());
+    }
+
+    bail!(
+        "OpenAI Responses multi-agent exceeded the {MAX_CONTINUATION_TURNS}-turn continuation limit"
+    )
 }
 
 fn validate_multi_agent_model(model: &Model) -> Result<()> {
@@ -73,7 +264,7 @@ fn validate_multi_agent_model(model: &Model) -> Result<()> {
 fn build_openai_responses_multi_agent_body(
     data: ChatCompletionsData,
     model: &Model,
-    max_concurrent_subagents: Option<NonZeroUsize>,
+    settings: &MultiAgentConfig,
 ) -> Result<Value> {
     let ChatCompletionsData {
         messages,
@@ -88,26 +279,44 @@ fn build_openai_responses_multi_agent_body(
         .map(build_responses_message)
         .collect::<Result<Vec<_>>>()?;
     let mut multi_agent = json!({"enabled": true});
-    if let Some(max_concurrent_subagents) = max_concurrent_subagents {
+    if let Some(max_concurrent_subagents) = settings.max_concurrent_subagents {
         multi_agent["max_concurrent_subagents"] = max_concurrent_subagents.get().into();
+    }
+    let web_search_count = settings
+        .hosted_tools
+        .iter()
+        .filter(|tool| matches!(tool, MultiAgentHostedTool::WebSearch { .. }))
+        .count();
+    let has_web_search = web_search_count != 0;
+    if web_search_count > 1 {
+        bail!("multi_agent.hosted_tools may contain web_search at most once")
+    }
+    let mut include = vec![json!("reasoning.encrypted_content")];
+    if has_web_search {
+        include.push(json!("web_search_call.action.sources"));
     }
     let mut body = json!({
         "model": model.real_name(),
         "input": input,
         "instructions": MULTI_AGENT_INSTRUCTIONS,
         "store": false,
-        "include": ["reasoning.encrypted_content"],
-        "service_tier": "auto",
+        "include": include,
+        "service_tier": settings.service_tier.as_str(),
         "multi_agent": multi_agent,
     });
 
+    let mut tools = Vec::new();
     if let Some(functions) = functions {
-        body["tools"] = Value::Array(
-            functions
-                .into_iter()
-                .map(build_responses_tool)
-                .collect::<Vec<_>>(),
-        );
+        tools.extend(functions.into_iter().map(build_responses_tool));
+    }
+    tools.extend(settings.hosted_tools.iter().map(build_hosted_tool));
+    if tools.is_empty() {
+        if settings.tool_choice == MultiAgentToolChoice::Required {
+            bail!("multi_agent.tool_choice=required requires at least one configured tool")
+        }
+    } else {
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = settings.tool_choice.as_str().into();
     }
     if let Some(effort) = model.reasoning_effort() {
         body["reasoning"] = json!({"effort": effort});
@@ -119,11 +328,43 @@ fn build_openai_responses_multi_agent_body(
             body["top_p"] = top_p.into();
         }
     }
-    if let Some(max_output_tokens) = model.max_tokens_param() {
+    if let Some(max_output_tokens) = settings.max_output_tokens {
+        body["max_output_tokens"] = max_output_tokens.get().into();
+    } else if let Some(max_output_tokens) = model.max_tokens_param() {
         body["max_output_tokens"] = max_output_tokens.into();
     }
 
     Ok(body)
+}
+
+fn build_hosted_tool(tool: &MultiAgentHostedTool) -> Value {
+    match tool {
+        MultiAgentHostedTool::WebSearch { config } => build_web_search_tool(config),
+    }
+}
+
+fn build_web_search_tool(config: &HostedWebSearchConfig) -> Value {
+    let mut tool = json!({
+        "type": "web_search",
+        "search_context_size": config.search_context_size.as_str(),
+        "return_token_budget": config.return_token_budget.as_str(),
+    });
+    if let Some(external_web_access) = config.external_web_access {
+        tool["external_web_access"] = external_web_access.into();
+    }
+    if let Some(filters) = &config.filters {
+        let mut value = json!({});
+        if !filters.allowed_domains.is_empty() {
+            value["allowed_domains"] = json!(filters.allowed_domains);
+        }
+        if !filters.blocked_domains.is_empty() {
+            value["blocked_domains"] = json!(filters.blocked_domains);
+        }
+        if value.as_object().is_some_and(|value| !value.is_empty()) {
+            tool["filters"] = value;
+        }
+    }
+    tool
 }
 
 fn build_responses_message(message: Message) -> Result<Value> {
@@ -183,13 +424,39 @@ fn build_responses_tool(function: FunctionDeclaration) -> Value {
     })
 }
 
+fn prepare_openai_responses_request(
+    client: &super::OpenAIClient,
+    body: Value,
+) -> Result<RequestData> {
+    let mut request = client.prepare_responses_request(body)?;
+    client.patch_request_data_for_api(&mut request, RequestApi::Responses);
+    Ok(request)
+}
+
+fn is_public_openai_responses_endpoint(request: &RequestData) -> bool {
+    request.url.trim_end_matches('/') == "https://api.openai.com/v1/responses"
+}
+
+fn responses_pricing_context(
+    request: &RequestData,
+    model: &Model,
+) -> OpenAIResponsesPricingContext {
+    if !is_public_openai_responses_endpoint(request) {
+        return OpenAIResponsesPricingContext::UnknownApiBase;
+    }
+    if request.body.get("model").and_then(Value::as_str) != Some(model.real_name()) {
+        return OpenAIResponsesPricingContext::UnknownModel;
+    }
+    OpenAIResponsesPricingContext::PublicApi
+}
+
 async fn send_openai_responses_turn(
     client: &super::OpenAIClient,
     http: &ReqwestClient,
     body: Value,
 ) -> Result<Value> {
     retry_request(|| {
-        let request = client.prepare_responses_request(body.clone());
+        let request = prepare_openai_responses_request(client, body.clone());
         async move {
             let request = request?.into_builder(http);
             send_openai_responses_request(request).await
@@ -256,130 +523,6 @@ struct CachedFunctionCall {
     output: Value,
 }
 
-async fn run_multi_agent_loop<S, SFut, E>(
-    mut body: Value,
-    abort_signal: &AbortSignal,
-    mut send: S,
-    mut execute: E,
-) -> Result<OpenAIResponsesOutput>
-where
-    S: FnMut(Value) -> SFut,
-    SFut: Future<Output = Result<Value>>,
-    E: FnMut(Vec<OpenAIResponsesFunctionCall>) -> Result<Vec<Value>>,
-{
-    let mut input_items = body
-        .get("input")
-        .and_then(Value::as_array)
-        .cloned()
-        .context("OpenAI Responses request input must be an array")?;
-    let mut cache: HashMap<String, CachedFunctionCall> = HashMap::new();
-    let mut cached_only_signatures = HashSet::new();
-    let mut total_usage: Option<TokenUsage> = None;
-    let mut turns = Vec::new();
-
-    for _ in 0..MAX_CONTINUATION_TURNS {
-        let response = tokio::select! {
-            response = send(body.clone()) => response?,
-            _ = wait_abort_signal(abort_signal) => bail!("Aborted."),
-        };
-        let result = parse_openai_responses_multi_agent(&response)?;
-        total_usage = Some(match total_usage {
-            Some(mut total) => {
-                total.add(result.usage);
-                total
-            }
-            None => result.usage,
-        });
-        turns.push(OpenAIResponsesTurn {
-            response_id: result.response_id.clone(),
-            service_tier: result.service_tier.clone(),
-            usage: result.detailed_usage.clone(),
-            trace: result.trace.clone(),
-        });
-        input_items.extend(result.output_items.iter().cloned());
-
-        if result.function_calls.is_empty() {
-            let text = result.root_final_text.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI Responses request '{}' completed without a root final answer",
-                    result.response_id
-                )
-            })?;
-            let usage = total_usage.unwrap_or_default();
-            return Ok(OpenAIResponsesOutput {
-                completion: ChatCompletionsOutput {
-                    text,
-                    id: Some(result.response_id),
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    ..Default::default()
-                },
-                turns,
-                pricing_context: OpenAIResponsesPricingContext::UnknownApiBase,
-            });
-        }
-        if abort_signal.aborted() {
-            bail!("Aborted.")
-        }
-
-        let mut new_calls = Vec::new();
-        let mut pending_by_call_id: HashMap<String, usize> = HashMap::new();
-        for call in &result.function_calls {
-            if let Some(cached) = cache.get(&call.call_id) {
-                validate_cached_call(call, cached)?;
-                continue;
-            }
-            if let Some(index) = pending_by_call_id.get(&call.call_id) {
-                validate_same_call(call, &new_calls[*index])?;
-                continue;
-            }
-            pending_by_call_id.insert(call.call_id.clone(), new_calls.len());
-            new_calls.push(call.clone());
-        }
-
-        if new_calls.is_empty() {
-            let signature = cached_call_signature(&result.function_calls)?;
-            if !cached_only_signatures.insert(signature) {
-                bail!(
-                    "OpenAI Responses multi-agent repeated the same cached function-call cycle without making progress"
-                )
-            }
-        } else {
-            cached_only_signatures.clear();
-            let outputs = execute(new_calls.clone())?;
-            if outputs.len() != new_calls.len() {
-                bail!(
-                    "Responses tool executor returned {} results for {} function calls",
-                    outputs.len(),
-                    new_calls.len()
-                )
-            }
-            for (call, output) in new_calls.into_iter().zip(outputs) {
-                cache.insert(
-                    call.call_id,
-                    CachedFunctionCall {
-                        name: call.name,
-                        arguments: call.arguments,
-                        output,
-                    },
-                );
-            }
-        }
-
-        for call in &result.function_calls {
-            let cached = cache
-                .get(&call.call_id)
-                .context("Responses function-call cache lost a completed result")?;
-            append_openai_function_call_output(&mut input_items, call, &cached.output);
-        }
-        body["input"] = Value::Array(input_items.clone());
-    }
-
-    bail!(
-        "OpenAI Responses multi-agent exceeded the {MAX_CONTINUATION_TURNS}-turn continuation limit"
-    )
-}
-
 fn validate_cached_call(
     call: &OpenAIResponsesFunctionCall,
     cached: &CachedFunctionCall,
@@ -436,10 +579,43 @@ pub struct OpenAIResponsesFunctionCall {
     pub agent_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct OpenAIResponsesProgress {
+    state: Arc<Mutex<OpenAIResponsesProgressState>>,
+}
+
+#[derive(Debug, Default)]
+struct OpenAIResponsesProgressState {
+    turns: Vec<OpenAIResponsesTurn>,
+    pricing_context: Option<OpenAIResponsesPricingContext>,
+}
+
+impl OpenAIResponsesProgress {
+    fn set_pricing_context(&self, pricing_context: OpenAIResponsesPricingContext) {
+        self.state.lock().pricing_context = Some(pricing_context);
+    }
+
+    fn push_turn(&self, turn: OpenAIResponsesTurn) {
+        self.state.lock().turns.push(turn);
+    }
+
+    pub fn snapshot(&self) -> (Vec<OpenAIResponsesTurn>, OpenAIResponsesPricingContext) {
+        let state = self.state.lock();
+        (
+            state.turns.clone(),
+            state
+                .pricing_context
+                .unwrap_or(OpenAIResponsesPricingContext::UnknownApiBase),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAIResponsesOutput {
     pub completion: ChatCompletionsOutput,
     pub turns: Vec<OpenAIResponsesTurn>,
+    pub citations: Vec<OpenAIResponsesUrlCitation>,
+    pub sources: Vec<OpenAIResponsesSource>,
     pub pricing_context: OpenAIResponsesPricingContext,
 }
 
@@ -463,6 +639,34 @@ pub struct OpenAIResponsesTurn {
     pub service_tier: Option<String>,
     pub usage: OpenAIResponsesUsage,
     pub trace: Vec<OpenAIResponsesTraceEvent>,
+    pub web_search_calls: Vec<OpenAIResponsesWebSearchCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAIResponsesSource {
+    pub url: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAIResponsesUrlCitation {
+    pub source: OpenAIResponsesSource,
+    pub start_index: Option<u64>,
+    pub end_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAIResponsesWebSearchAction {
+    Search,
+    OpenPage,
+    Find,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAIResponsesWebSearchCall {
+    pub action: OpenAIResponsesWebSearchAction,
+    pub sources: Vec<OpenAIResponsesSource>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -478,6 +682,7 @@ pub struct OpenAIResponsesUsage {
 pub enum OpenAIResponsesPricingContext {
     PublicApi,
     UnknownApiBase,
+    UnknownModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,10 +770,12 @@ pub struct OpenAIResponsesMultiAgentResult {
     pub output_items: Vec<Value>,
     pub function_calls: Vec<OpenAIResponsesFunctionCall>,
     pub root_final_text: Option<String>,
+    pub root_final_citations: Vec<OpenAIResponsesUrlCitation>,
     pub usage: TokenUsage,
     pub service_tier: Option<String>,
     pub detailed_usage: OpenAIResponsesUsage,
     pub trace: Vec<OpenAIResponsesTraceEvent>,
+    pub web_search_calls: Vec<OpenAIResponsesWebSearchCall>,
 }
 
 #[derive(Debug)]
@@ -677,6 +884,39 @@ struct ResponseOutputTokensDetails {
     reasoning_tokens: Option<u64>,
 }
 
+fn observe_openai_responses_turn(response: &Value) -> Option<OpenAIResponsesTurn> {
+    let envelope: ResponseEnvelope = serde_json::from_value(response.clone()).ok()?;
+    Some(OpenAIResponsesTurn {
+        response_id: envelope.id,
+        service_tier: envelope.service_tier,
+        usage: detailed_response_usage(envelope.usage.as_ref()),
+        trace: extract_trace(&envelope.output),
+        web_search_calls: extract_web_search_calls(&envelope.output),
+    })
+}
+
+fn detailed_response_usage(usage: Option<&ResponseUsage>) -> OpenAIResponsesUsage {
+    let Some(usage) = usage else {
+        return OpenAIResponsesUsage::default();
+    };
+    OpenAIResponsesUsage {
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens),
+        cache_write_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens),
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage
+            .output_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens),
+    }
+}
+
 pub fn parse_openai_responses_multi_agent(
     response: &Value,
 ) -> Result<OpenAIResponsesMultiAgentResult, OpenAIResponsesMultiAgentError> {
@@ -718,8 +958,9 @@ pub fn parse_openai_responses_multi_agent(
         .filter(|(_, item)| item.get("type").and_then(Value::as_str) == Some("function_call"))
         .map(|(output_index, item)| parse_function_call(output_index, item))
         .collect::<Result<Vec<_>, _>>()?;
-    let root_final_text = extract_root_final_text(&envelope.output);
+    let (root_final_text, root_final_citations) = extract_root_final(&envelope.output);
     let trace = extract_trace(&envelope.output);
+    let web_search_calls = extract_web_search_calls(&envelope.output);
 
     if function_calls.is_empty() && root_final_text.is_none() {
         return Err(OpenAIResponsesMultiAgentError::MissingRootFinal {
@@ -727,25 +968,7 @@ pub fn parse_openai_responses_multi_agent(
         });
     }
 
-    let detailed_usage = envelope
-        .usage
-        .map_or_else(OpenAIResponsesUsage::default, |usage| {
-            let input_details = usage.input_tokens_details;
-            let output_details = usage.output_tokens_details;
-            OpenAIResponsesUsage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: input_details
-                    .as_ref()
-                    .and_then(|details| details.cached_tokens),
-                cache_write_input_tokens: input_details
-                    .as_ref()
-                    .and_then(|details| details.cache_write_tokens),
-                output_tokens: usage.output_tokens,
-                reasoning_output_tokens: output_details
-                    .as_ref()
-                    .and_then(|details| details.reasoning_tokens),
-            }
-        });
+    let detailed_usage = detailed_response_usage(envelope.usage.as_ref());
     let usage = TokenUsage::new(detailed_usage.input_tokens, detailed_usage.output_tokens);
 
     Ok(OpenAIResponsesMultiAgentResult {
@@ -754,10 +977,12 @@ pub fn parse_openai_responses_multi_agent(
         output_items: envelope.output,
         function_calls,
         root_final_text,
+        root_final_citations,
         usage,
         service_tier: envelope.service_tier,
         detailed_usage,
         trace,
+        web_search_calls,
     })
 }
 
@@ -1040,9 +1265,10 @@ fn required_function_call_string<'a>(
         })
 }
 
-fn extract_root_final_text(output: &[Value]) -> Option<String> {
+fn extract_root_final(output: &[Value]) -> (Option<String>, Vec<OpenAIResponsesUrlCitation>) {
     let mut text = String::new();
     let mut found_output_text = false;
+    let mut citations = Vec::new();
 
     for item in output {
         if item.get("type").and_then(Value::as_str) != Some("message")
@@ -1064,11 +1290,158 @@ fn extract_root_final_text(output: &[Value]) -> Option<String> {
                     found_output_text = true;
                     text.push_str(part_text);
                 }
+                if let Some(annotations) = part.get("annotations").and_then(Value::as_array) {
+                    citations.extend(annotations.iter().filter_map(parse_url_citation));
+                }
             }
         }
     }
 
-    found_output_text.then_some(text)
+    (found_output_text.then_some(text), citations)
+}
+
+fn parse_url_citation(annotation: &Value) -> Option<OpenAIResponsesUrlCitation> {
+    if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+        return None;
+    }
+    let citation = annotation.get("url_citation").unwrap_or(annotation);
+    let source = parse_source(citation)?;
+    let start_index = citation.get("start_index").and_then(Value::as_u64);
+    let end_index = citation.get("end_index").and_then(Value::as_u64);
+    let (start_index, end_index) = match (start_index, end_index) {
+        (Some(start), Some(end)) if start <= end => (Some(start), Some(end)),
+        _ => (None, None),
+    };
+    Some(OpenAIResponsesUrlCitation {
+        source,
+        start_index,
+        end_index,
+    })
+}
+
+fn extract_web_search_calls(output: &[Value]) -> Vec<OpenAIResponsesWebSearchCall> {
+    output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+        .map(|item| {
+            let action = item.get("action");
+            let action_type = action
+                .and_then(|action| action.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let action = match action_type {
+                "search" => OpenAIResponsesWebSearchAction::Search,
+                "open_page" => OpenAIResponsesWebSearchAction::OpenPage,
+                "find" | "find_in_page" => OpenAIResponsesWebSearchAction::Find,
+                value => OpenAIResponsesWebSearchAction::Other(sanitize_display(value, 64)),
+            };
+            let mut sources = Vec::new();
+            if let Some(values) = item
+                .get("action")
+                .and_then(|action| action.get("sources"))
+                .and_then(Value::as_array)
+            {
+                merge_sources(
+                    &mut sources,
+                    values.iter().take(256).filter_map(parse_source),
+                );
+            }
+            OpenAIResponsesWebSearchCall { action, sources }
+        })
+        .collect()
+}
+
+fn parse_source(value: &Value) -> Option<OpenAIResponsesSource> {
+    let url = sanitize_source_url(value.get("url").and_then(Value::as_str)?)?;
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(sanitize_source_title);
+    Some(OpenAIResponsesSource { url, title })
+}
+
+fn sanitize_source_url(value: &str) -> Option<String> {
+    if value
+        .chars()
+        .any(|character| character.is_control() || is_unicode_format_control(character))
+    {
+        return None;
+    }
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let url = url.to_string();
+    (!url.contains('<') && !url.contains('>')).then_some(url)
+}
+
+fn sanitize_source_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let sanitized = sanitize_display(value, 200);
+    if sanitized == "unavailable" && value != "unavailable" {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn merge_sources(
+    sources: &mut Vec<OpenAIResponsesSource>,
+    incoming: impl IntoIterator<Item = OpenAIResponsesSource>,
+) {
+    for source in incoming {
+        if let Some(existing) = sources
+            .iter_mut()
+            .find(|existing| existing.url == source.url)
+        {
+            if source.title.is_some() {
+                existing.title = source.title;
+            }
+        } else if sources.len() < 256 {
+            sources.push(source);
+        }
+    }
+}
+
+fn append_sources_block(mut text: String, sources: &[OpenAIResponsesSource]) -> String {
+    if sources.is_empty() {
+        return text;
+    }
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str("Sources:");
+    for source in sources {
+        let title = source.title.as_deref().unwrap_or(&source.url);
+        let _ = write!(
+            text,
+            "\n- [{}](<{}>)",
+            escape_markdown_label(title),
+            source.url
+        );
+    }
+    text
+}
+
+fn escape_markdown_label(value: &str) -> String {
+    sanitize_display(value, 200)
+        .chars()
+        .flat_map(|character| {
+            if matches!(character, '\\' | '[' | ']' | '*' | '_' | '`' | '<' | '>') {
+                [Some('\\'), Some(character)]
+            } else {
+                [Some(character), None]
+            }
+        })
+        .flatten()
+        .collect()
 }
 
 fn display_optional_value(value: &Option<Value>) -> String {
@@ -1133,22 +1506,51 @@ pub fn format_openai_responses_usage_cost(
         summary.push_str(" (reasoning details unavailable)");
     }
 
-    match calculate_openai_responses_cost(model, turns, pricing_context) {
+    let token_cost = calculate_openai_responses_token_cost(model, turns, pricing_context);
+    match &token_cost {
         Ok(cost) => {
-            let _ = write!(summary, "\nEstimated cost: ${cost:.6}");
+            let _ = write!(summary, "\nEstimated token subtotal: ${cost:.6}");
         }
         Err(reason) => {
             let _ = write!(
                 summary,
-                "\nEstimated cost: unavailable ({})",
-                sanitize_display(&reason, 240)
+                "\nEstimated token subtotal: unavailable ({})",
+                sanitize_display(reason, 240)
             );
         }
+    }
+    let web_search_calls = billable_web_search_calls(turns);
+    let web_search_fee = calculate_web_search_fee(model, turns, pricing_context);
+    match &web_search_fee {
+        Ok(fee) => {
+            let _ = write!(
+                summary,
+                "\nHosted web searches: {web_search_calls} | Fee: ${fee:.6}"
+            );
+        }
+        Err(reason) => {
+            let _ = write!(
+                summary,
+                "\nHosted web searches: {web_search_calls} | Fee: unavailable ({})",
+                sanitize_display(reason, 240)
+            );
+        }
+    }
+    match (token_cost, web_search_fee) {
+        (Ok(token_cost), Ok(web_search_fee)) => {
+            let total = token_cost + web_search_fee;
+            if total.is_finite() {
+                let _ = write!(summary, "\nEstimated total cost: ${total:.6}");
+            } else {
+                summary.push_str("\nEstimated total cost: unavailable");
+            }
+        }
+        _ => summary.push_str("\nEstimated total cost: unavailable"),
     }
     summary
 }
 
-fn calculate_openai_responses_cost(
+fn calculate_openai_responses_token_cost(
     model: &Model,
     turns: &[OpenAIResponsesTurn],
     pricing_context: OpenAIResponsesPricingContext,
@@ -1156,8 +1558,17 @@ fn calculate_openai_responses_cost(
     if turns.is_empty() {
         return Err("no response usage was returned".to_string());
     }
-    if pricing_context != OpenAIResponsesPricingContext::PublicApi {
-        return Err("custom OpenAI api_base has unknown pricing".to_string());
+    match pricing_context {
+        OpenAIResponsesPricingContext::PublicApi => {}
+        OpenAIResponsesPricingContext::UnknownApiBase => {
+            return Err("custom OpenAI api_base has unknown pricing".to_string());
+        }
+        OpenAIResponsesPricingContext::UnknownModel => {
+            return Err(
+                "effective OpenAI Responses model does not match selected model pricing"
+                    .to_string(),
+            );
+        }
     }
     let input_price = valid_price(model.data().input_price, "model input price")?;
     let output_price = valid_price(model.data().output_price, "model output price")?;
@@ -1255,6 +1666,56 @@ fn calculate_openai_responses_cost(
         return Err("calculated response cost is invalid".to_string());
     }
     Ok(total)
+}
+
+fn billable_web_search_calls(turns: &[OpenAIResponsesTurn]) -> u64 {
+    turns
+        .iter()
+        .flat_map(|turn| &turn.web_search_calls)
+        .filter(|call| matches!(call.action, OpenAIResponsesWebSearchAction::Search))
+        .count() as u64
+}
+
+fn calculate_web_search_fee(
+    model: &Model,
+    turns: &[OpenAIResponsesTurn],
+    pricing_context: OpenAIResponsesPricingContext,
+) -> std::result::Result<f64, String> {
+    if turns
+        .iter()
+        .flat_map(|turn| &turn.web_search_calls)
+        .any(|call| matches!(call.action, OpenAIResponsesWebSearchAction::Other(_)))
+    {
+        return Err("response contains an unknown web-search action".to_string());
+    }
+    let calls = billable_web_search_calls(turns);
+    if calls == 0 {
+        return Ok(0.0);
+    }
+    match pricing_context {
+        OpenAIResponsesPricingContext::PublicApi => {}
+        OpenAIResponsesPricingContext::UnknownApiBase => {
+            return Err("custom OpenAI api_base has unknown hosted-tool pricing".to_string());
+        }
+        OpenAIResponsesPricingContext::UnknownModel => {
+            return Err(
+                "effective OpenAI Responses model does not match selected model pricing"
+                    .to_string(),
+            );
+        }
+    }
+    let price = model
+        .data()
+        .response_pricing
+        .as_ref()
+        .and_then(|pricing| pricing.web_search_call_price)
+        .ok_or_else(|| "model web-search call price is missing".to_string())?;
+    let price = valid_number(price, true, "web-search call price")?;
+    let fee = calls as f64 * price;
+    if !fee.is_finite() {
+        return Err("calculated web-search fee is invalid".to_string());
+    }
+    Ok(fee)
 }
 
 fn valid_price(value: Option<f64>, name: &str) -> std::result::Result<f64, String> {
@@ -1456,11 +1917,23 @@ fn is_unicode_format_control(character: char) -> bool {
 mod tests {
     use super::*;
 
-    use crate::client::{ImageUrl, ModelData, OpenAIClient, OpenAIConfig, ResponsePricing};
+    use crate::cli::Cli;
+    use crate::client::{
+        ImageUrl, ModelData, ModelType, OpenAIClient, OpenAIConfig, ResponsePricing,
+    };
+    use crate::config::{
+        Config, OpenAIServiceTier, WebSearchContextSize, WebSearchFilters,
+        WebSearchReturnTokenBudget,
+    };
+    use crate::configure_multi_agent;
     use crate::utils::create_abort_signal;
+    use clap::Parser;
+    use parking_lot::RwLock;
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
     use std::future::{pending, ready};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
     const MIXED_OUTPUT_FIXTURE: &str = r#"
     {
@@ -1617,6 +2090,146 @@ mod tests {
         assert_eq!(result.usage, TokenUsage::new(Some(120), Some(30)));
     }
 
+    fn response_with_web_sources_and_citations() -> Value {
+        json!({
+            "id": "resp_sources",
+            "status": "completed",
+            "service_tier": "default",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "agent": {"agent_name": "/root/research"},
+                    "action": {
+                        "type": "search",
+                        "query": "private query",
+                        "sources": [
+                            {"type": "url", "url": "https://example.com/report"},
+                            {"type": "url", "url": "javascript:alert(1)", "title": "bad"},
+                            {"type": "url", "url": "https://bad.example/\npath", "title": "bad"}
+                        ]
+                    }
+                },
+                {
+                    "type": "web_search_call",
+                    "action": {
+                        "type": "open_page",
+                        "sources": [{
+                            "type": "url",
+                            "url": "https://docs.example/🙂",
+                            "title": "older title"
+                        }]
+                    }
+                },
+                {"type": "web_search_call", "action": {"type": "find"}},
+                {"type": "web_search_call", "action": {"type": "future_action"}},
+                {
+                    "type": "message",
+                    "agent": {"agent_name": "/root"},
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "分析🙂done",
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "url": "https://example.com/report",
+                                "title": "Better *title*\n\u{202e}raw",
+                                "start_index": 99,
+                                "end_index": 1
+                            },
+                            {
+                                "type": "url_citation",
+                                "url_citation": {
+                                    "url": "https://docs.example/🙂",
+                                    "title": "Docs ] _guide_",
+                                    "start_index": 1,
+                                    "end_index": 2
+                                }
+                            },
+                            {"type": "url_citation", "url": "file:///etc/passwd"},
+                            {"type": "other", "url": "https://ignored.example"}
+                        ]
+                    }]
+                }
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "output_tokens": 2,
+                "output_tokens_details": {"reasoning_tokens": 0}
+            },
+            "error": null,
+            "incomplete_details": null
+        })
+    }
+
+    #[test]
+    fn parses_safe_citations_sources_and_web_search_action_kinds() {
+        let result =
+            parse_openai_responses_multi_agent(&response_with_web_sources_and_citations()).unwrap();
+
+        assert_eq!(result.root_final_text.as_deref(), Some("分析🙂done"));
+        assert_eq!(result.root_final_citations.len(), 2);
+        assert_eq!(result.root_final_citations[0].start_index, None);
+        assert_eq!(result.root_final_citations[0].end_index, None);
+        assert_eq!(result.root_final_citations[1].start_index, Some(1));
+        assert_eq!(result.root_final_citations[1].end_index, Some(2));
+        assert_eq!(result.web_search_calls.len(), 4);
+        assert!(matches!(
+            result.web_search_calls[0].action,
+            OpenAIResponsesWebSearchAction::Search
+        ));
+        assert!(matches!(
+            result.web_search_calls[1].action,
+            OpenAIResponsesWebSearchAction::OpenPage
+        ));
+        assert!(matches!(
+            result.web_search_calls[2].action,
+            OpenAIResponsesWebSearchAction::Find
+        ));
+        assert!(matches!(
+            &result.web_search_calls[3].action,
+            OpenAIResponsesWebSearchAction::Other(value) if value == "future_action"
+        ));
+        assert_eq!(result.web_search_calls[0].sources.len(), 1);
+        assert_eq!(result.web_search_calls[1].sources.len(), 1);
+        assert_eq!(
+            result.web_search_calls[1].sources[0].title.as_deref(),
+            Some("older title")
+        );
+    }
+
+    #[tokio::test]
+    async fn renders_deduplicated_markdown_sources_without_slicing_unicode_text() {
+        let response = response_with_web_sources_and_citations();
+        let output = run_multi_agent_loop(
+            json!({"input": []}),
+            &create_abort_signal(),
+            |_| ready(Ok(response.clone())),
+            |_| unreachable!("the fixture has no developer function calls"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.citations.len(), 2);
+        assert_eq!(output.sources.len(), 2);
+        assert!(output
+            .completion
+            .text
+            .starts_with("分析🙂done\n\nSources:\n"));
+        assert!(output
+            .completion
+            .text
+            .contains("- [Better \\*title\\* raw](<https://example.com/report>)"));
+        assert!(output
+            .completion
+            .text
+            .contains("- [Docs \\] \\_guide\\_](<https://docs.example/%F0%9F%99%82>)"));
+        assert!(!output.completion.text.contains("javascript:"));
+        assert!(!output.completion.text.contains("file:///"));
+        assert!(!output.completion.text.contains('\u{202e}'));
+    }
+
     #[test]
     fn trace_is_ordered_correlated_sanitized_and_payload_free() {
         let raw = json!({
@@ -1663,7 +2276,15 @@ mod tests {
                 {
                     "type": "web_search_call",
                     "agent": {"agent_name": "/root/research"},
-                    "query": "query-secret",
+                    "action": {
+                        "type": "search",
+                        "query": "query-secret",
+                        "sources": [{
+                            "type": "url",
+                            "url": "https://source-secret.example/path",
+                            "title": "source-title-secret"
+                        }]
+                    },
                     "results": "result-secret"
                 },
                 {
@@ -1691,6 +2312,7 @@ mod tests {
             service_tier: parsed.service_tier,
             usage: parsed.detailed_usage,
             trace: parsed.trace,
+            web_search_calls: parsed.web_search_calls,
         };
         assert!(matches!(
             &turn.trace[1],
@@ -1727,6 +2349,8 @@ mod tests {
             "message-secret",
             "query-secret",
             "result-secret",
+            "source-secret",
+            "source-title-secret",
             "developer-secret",
             "final-secret",
         ] {
@@ -2029,6 +2653,7 @@ mod tests {
         data.response_pricing = Some(ResponsePricing {
             cached_input_price: 2.0,
             cache_write_input_price: 12.5,
+            web_search_call_price: Some(0.01),
             long_context_threshold: 100,
             long_context_input_multiplier: 2.0,
             long_context_output_multiplier: 1.5,
@@ -2064,6 +2689,7 @@ mod tests {
                 reasoning_output_tokens: Some(reasoning),
             },
             trace: Vec::new(),
+            web_search_calls: Vec::new(),
         }
     }
 
@@ -2071,7 +2697,18 @@ mod tests {
         model: &Model,
         turns: &[OpenAIResponsesTurn],
     ) -> std::result::Result<f64, String> {
-        calculate_openai_responses_cost(model, turns, OpenAIResponsesPricingContext::PublicApi)
+        let token_cost = calculate_openai_responses_token_cost(
+            model,
+            turns,
+            OpenAIResponsesPricingContext::PublicApi,
+        )?;
+        let web_search_fee =
+            calculate_web_search_fee(model, turns, OpenAIResponsesPricingContext::PublicApi)?;
+        let total = token_cost + web_search_fee;
+        total
+            .is_finite()
+            .then_some(total)
+            .ok_or_else(|| "calculated total response cost is invalid".to_string())
     }
 
     fn format_public_responses_cost(model: &Model, turns: &[OpenAIResponsesTurn]) -> String {
@@ -2094,7 +2731,9 @@ mod tests {
         assert!(formatted.contains("141 uncached + 40 cached + 20 cache write"));
         assert!(formatted.contains("20 output (13 reasoning)"));
         assert!(formatted.contains("Service tiers: default, flex"));
-        assert!(formatted.contains("Estimated cost: $0.002090"));
+        assert!(formatted.contains("Estimated token subtotal: $0.002090"));
+        assert!(formatted.contains("Hosted web searches: 0 | Fee: $0.000000"));
+        assert!(formatted.contains("Estimated total cost: $0.002090"));
     }
 
     #[test]
@@ -2107,6 +2746,94 @@ mod tests {
             public_responses_cost(&model, &no_reasoning).unwrap(),
             public_responses_cost(&model, &all_reasoning).unwrap()
         );
+    }
+
+    #[test]
+    fn web_search_cost_counts_search_actions_without_double_charging_tokens() {
+        let model = priced_responses_model();
+        let mut turn = usage_turn("one", Some("default"), 10, 0, 0, 8, 8);
+        turn.web_search_calls = vec![
+            OpenAIResponsesWebSearchCall {
+                action: OpenAIResponsesWebSearchAction::Search,
+                sources: Vec::new(),
+            },
+            OpenAIResponsesWebSearchCall {
+                action: OpenAIResponsesWebSearchAction::OpenPage,
+                sources: Vec::new(),
+            },
+            OpenAIResponsesWebSearchCall {
+                action: OpenAIResponsesWebSearchAction::Find,
+                sources: Vec::new(),
+            },
+            OpenAIResponsesWebSearchCall {
+                action: OpenAIResponsesWebSearchAction::Search,
+                sources: Vec::new(),
+            },
+        ];
+
+        let token_cost = calculate_openai_responses_token_cost(
+            &model,
+            std::slice::from_ref(&turn),
+            OpenAIResponsesPricingContext::PublicApi,
+        )
+        .unwrap();
+        let total = public_responses_cost(&model, std::slice::from_ref(&turn)).unwrap();
+
+        assert!((token_cost - 0.00026).abs() < f64::EPSILON);
+        assert!((total - 0.02026).abs() < f64::EPSILON);
+        assert_eq!(billable_web_search_calls(std::slice::from_ref(&turn)), 2);
+        let summary = format_public_responses_cost(&model, &[turn]);
+        assert!(summary.contains("Estimated token subtotal: $0.000260"));
+        assert!(summary.contains("Hosted web searches: 2 | Fee: $0.020000"));
+        assert!(summary.contains("Estimated total cost: $0.020260"));
+    }
+
+    #[test]
+    fn unknown_web_search_action_never_formats_exact_fee_or_total() {
+        let model = priced_responses_model();
+        for item in [
+            json!({"type": "web_search_call", "action": {"type": "future_action"}}),
+            json!({"type": "web_search_call"}),
+            json!({"type": "web_search_call", "action": {"type": 42}}),
+        ] {
+            let mut turn = usage_turn("one", Some("default"), 10, 0, 0, 8, 0);
+            turn.web_search_calls = extract_web_search_calls(&[item]);
+            assert!(matches!(
+                &turn.web_search_calls[0].action,
+                OpenAIResponsesWebSearchAction::Other(_)
+            ));
+
+            let summary = format_public_responses_cost(&model, &[turn]);
+
+            assert!(summary.contains("Estimated token subtotal: $0.000260"));
+            assert!(summary.contains("Hosted web searches: 0 | Fee: unavailable"));
+            assert!(summary.contains("unknown web-search action"));
+            assert!(!summary.contains("Hosted web searches: 0 | Fee: $0.000000"));
+            assert!(summary.contains("Estimated total cost: unavailable"));
+        }
+    }
+
+    #[test]
+    fn web_search_total_is_unavailable_when_call_pricing_is_missing() {
+        let mut model = priced_responses_model();
+        model
+            .data_mut()
+            .response_pricing
+            .as_mut()
+            .unwrap()
+            .web_search_call_price = None;
+        let mut turn = usage_turn("one", Some("default"), 10, 0, 0, 8, 0);
+        turn.web_search_calls.push(OpenAIResponsesWebSearchCall {
+            action: OpenAIResponsesWebSearchAction::Search,
+            sources: Vec::new(),
+        });
+
+        let summary = format_public_responses_cost(&model, &[turn]);
+
+        assert!(summary.contains("Estimated token subtotal: $0.000260"));
+        assert!(summary.contains("Hosted web searches: 1 | Fee: unavailable"));
+        assert!(summary.contains("model web-search call price is missing"));
+        assert!(summary.contains("Estimated total cost: unavailable"));
     }
 
     #[test]
@@ -2125,9 +2852,8 @@ mod tests {
         assert!(public_responses_cost(&model, &invalid)
             .unwrap_err()
             .contains("greater than input tokens"));
-        assert!(
-            format_public_responses_cost(&model, &invalid).contains("Estimated cost: unavailable")
-        );
+        assert!(format_public_responses_cost(&model, &invalid)
+            .contains("Estimated total cost: unavailable"));
     }
 
     #[test]
@@ -2169,9 +2895,9 @@ mod tests {
             OpenAIResponsesPricingContext::UnknownApiBase,
         );
 
-        assert!(summary.contains("Estimated cost: unavailable"));
+        assert!(summary.contains("Estimated token subtotal: unavailable"));
+        assert!(summary.contains("Estimated total cost: unavailable"));
         assert!(summary.contains("custom OpenAI api_base has unknown pricing"));
-        assert!(!summary.contains('$'));
     }
 
     fn function_declaration() -> FunctionDeclaration {
@@ -2222,10 +2948,14 @@ mod tests {
             include_usage: true,
         };
 
+        let settings = MultiAgentConfig {
+            max_concurrent_subagents: NonZeroUsize::new(7),
+            ..Default::default()
+        };
         let body = build_openai_responses_multi_agent_body(
             data,
             &responses_model(Some("high")),
-            NonZeroUsize::new(7),
+            &settings,
         )
         .unwrap();
 
@@ -2270,6 +3000,7 @@ mod tests {
                         "required": ["key"]
                     }
                 }],
+                "tool_choice": "auto",
                 "reasoning": {"effort": "high"}
             })
         );
@@ -2291,8 +3022,12 @@ mod tests {
             include_usage: false,
         };
 
-        let body =
-            build_openai_responses_multi_agent_body(data, &responses_model(None), None).unwrap();
+        let body = build_openai_responses_multi_agent_body(
+            data,
+            &responses_model(None),
+            &MultiAgentConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["top_p"], 0.9);
@@ -2303,23 +3038,54 @@ mod tests {
     }
 
     #[test]
-    fn request_uses_responses_endpoint_beta_header_and_unpatched_body() {
-        let body = json!({"model": "gpt-5.6-sol", "input": []});
+    fn request_uses_responses_endpoint_headers_and_endpoint_patch() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "reasoning": {"effort": "high"}
+        });
+        let patch = serde_yaml::from_str(
+            r#"
+responses:
+  'gpt-5\.6-sol:high':
+    url: https://api.openai.com/v1/responses
+    body:
+      patched_for_responses: true
+    headers:
+      x-responses-patch: applied
+"#,
+        )
+        .expect("valid Responses patch");
+        let mut model = responses_model(Some("high"));
+        model.data_mut().patch = Some(json!({
+            "body": {"reasoning_effort": "high"},
+            "headers": {"x-chat-model-patch": "must-not-apply"}
+        }));
         let client = OpenAIClient {
             global_config: Default::default(),
             config: OpenAIConfig {
                 api_key: Some("test-key".into()),
                 api_base: Some("https://example.invalid/v1/".into()),
                 organization_id: Some("test-organization".into()),
+                patch: Some(patch),
                 ..Default::default()
             },
-            model: responses_model(None),
+            model,
         };
 
-        let request = client.prepare_responses_request(body.clone()).unwrap();
+        let raw_request = client.prepare_responses_request(body.clone()).unwrap();
 
-        assert_eq!(request.url, "https://example.invalid/v1/responses");
-        assert_eq!(request.body, body);
+        assert_eq!(raw_request.url, "https://example.invalid/v1/responses");
+        assert_eq!(raw_request.body, body);
+        let request = prepare_openai_responses_request(&client, body).unwrap();
+        assert_eq!(request.url, "https://api.openai.com/v1/responses");
+        assert_eq!(request.body["patched_for_responses"], true);
+        assert!(request.body.get("reasoning_effort").is_none());
+        assert_eq!(
+            request.headers.get("x-responses-patch").map(String::as_str),
+            Some("applied")
+        );
+        assert!(!request.headers.contains_key("x-chat-model-patch"));
         assert_eq!(
             request.headers.get("OpenAI-Beta").map(String::as_str),
             Some("responses_multi_agent=v1")
@@ -2335,17 +3101,368 @@ mod tests {
             request.headers.get("authorization").map(String::as_str),
             Some("Bearer test-key")
         );
-        assert!(!client.responses_uses_public_pricing().unwrap());
+        assert_eq!(
+            responses_pricing_context(&request, &client.model),
+            OpenAIResponsesPricingContext::PublicApi
+        );
+    }
 
-        let public_client = OpenAIClient {
+    #[test]
+    fn patched_or_malformed_effective_model_disables_selected_model_pricing() {
+        let patch = serde_yaml::from_str(
+            r#"
+responses:
+  'gpt-5\.6-sol':
+    body:
+      model: gpt-5.6-pro
+"#,
+        )
+        .expect("valid Responses patch");
+        let client = OpenAIClient {
             global_config: Default::default(),
             config: OpenAIConfig {
+                api_key: Some("test-key".into()),
                 api_base: Some("https://api.openai.com/v1/".into()),
+                patch: Some(patch),
                 ..Default::default()
             },
-            model: responses_model(None),
+            model: priced_responses_model(),
         };
-        assert!(public_client.responses_uses_public_pricing().unwrap());
+        let request =
+            prepare_openai_responses_request(&client, json!({"model": "gpt-5.6-sol", "input": []}))
+                .unwrap();
+
+        assert_eq!(request.body["model"], "gpt-5.6-pro");
+        let pricing_context = responses_pricing_context(&request, &client.model);
+        assert_eq!(pricing_context, OpenAIResponsesPricingContext::UnknownModel);
+        let summary = format_openai_responses_usage_cost(
+            &client.model,
+            &[usage_turn("one", Some("default"), 10, 0, 0, 1, 0)],
+            pricing_context,
+        );
+        assert!(summary.contains("Estimated token subtotal: unavailable"));
+        assert!(summary.contains("does not match selected model pricing"));
+        assert!(summary.contains("Estimated total cost: unavailable"));
+
+        for body in [json!({}), json!({"model": 42})] {
+            let request = RequestData::new("https://api.openai.com/v1/responses", body);
+            let pricing_context = responses_pricing_context(&request, &client.model);
+            assert_eq!(pricing_context, OpenAIResponsesPricingContext::UnknownModel);
+            let summary = format_openai_responses_usage_cost(
+                &client.model,
+                &[usage_turn("one", Some("default"), 10, 0, 0, 1, 0)],
+                pricing_context,
+            );
+            assert!(summary.contains("Estimated token subtotal: unavailable"));
+            assert!(summary.contains("Estimated total cost: unavailable"));
+        }
+    }
+
+    #[test]
+    fn builds_hosted_web_search_with_limits_and_developer_tools() {
+        let data = ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("research this market".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: Some(vec![function_declaration()]),
+            stream: false,
+            include_usage: true,
+        };
+        let settings = MultiAgentConfig {
+            max_concurrent_subagents: NonZeroUsize::new(3),
+            hosted_tools: vec![MultiAgentHostedTool::WebSearch {
+                config: HostedWebSearchConfig {
+                    search_context_size: WebSearchContextSize::High,
+                    external_web_access: Some(true),
+                    return_token_budget: WebSearchReturnTokenBudget::Unlimited,
+                    filters: Some(WebSearchFilters {
+                        allowed_domains: vec!["example.com".into()],
+                        blocked_domains: vec!["blocked.example".into()],
+                    }),
+                },
+            }],
+            tool_choice: MultiAgentToolChoice::Required,
+            max_output_tokens: NonZeroUsize::new(16_000),
+            service_tier: OpenAIServiceTier::Default,
+            ..Default::default()
+        };
+
+        let body = build_openai_responses_multi_agent_body(
+            data,
+            &responses_model(Some("high")),
+            &settings,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["max_output_tokens"], 16_000);
+        assert_eq!(body["service_tier"], "default");
+        assert_eq!(body["multi_agent"]["max_concurrent_subagents"], 3);
+        assert_eq!(body["reasoning"], json!({"effort": "high"}));
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(
+            body["tools"][1],
+            json!({
+                "type": "web_search",
+                "search_context_size": "high",
+                "external_web_access": true,
+                "return_token_budget": "unlimited",
+                "filters": {
+                    "allowed_domains": ["example.com"],
+                    "blocked_domains": ["blocked.example"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn exact_cli_and_config_build_sol_high_web_search_request() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+multi_agent:
+  hosted_tools:
+    - type: web_search
+      search_context_size: high
+      external_web_access: true
+      return_token_budget: default
+  tool_choice: required
+  max_output_tokens: 16000
+  service_tier: default
+clients:
+  - type: openai
+    api_key: test-key
+"#,
+        )
+        .unwrap();
+        let config = Arc::new(RwLock::new(config));
+        let cli = Cli::try_parse_from([
+            "aichat",
+            "--show-cost",
+            "--multi-agent",
+            "-m",
+            "openai:gpt-5.6-sol:high",
+            "perform siem systems market analysis",
+        ])
+        .unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+        if cli.show_cost {
+            config.write().show_cost = true;
+        }
+        let model = Model::retrieve_model(
+            &config.read(),
+            cli.model.as_deref().unwrap(),
+            ModelType::Chat,
+        )
+        .unwrap();
+        let settings = config.read().multi_agent.clone();
+        let body = build_openai_responses_multi_agent_body(
+            ChatCompletionsData {
+                messages: vec![Message::new(
+                    MessageRole::User,
+                    MessageContent::Text("perform siem systems market analysis".into()),
+                )],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                include_usage: true,
+            },
+            &model,
+            &settings,
+        )
+        .unwrap();
+        let client = init_openai_client(&config, &model).unwrap();
+        let request = prepare_openai_responses_request(&client, body).unwrap();
+
+        assert!(config.read().show_cost);
+        assert_eq!(model.real_name(), "gpt-5.6-sol");
+        assert_eq!(model.reasoning_effort(), Some("high"));
+        assert_eq!(request.url, "https://api.openai.com/v1/responses");
+        assert_eq!(
+            request.headers.get("OpenAI-Beta").map(String::as_str),
+            Some("responses_multi_agent=v1")
+        );
+        assert_eq!(request.body["model"], "gpt-5.6-sol");
+        assert_eq!(request.body["reasoning"], json!({"effort": "high"}));
+        assert_eq!(request.body["tools"][0]["type"], "web_search");
+        assert_eq!(request.body["tools"][0]["search_context_size"], "high");
+        assert_eq!(request.body["tool_choice"], "required");
+        assert_eq!(request.body["max_output_tokens"], 16_000);
+        assert_eq!(request.body["service_tier"], "default");
+        assert_eq!(
+            request.body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
+    }
+
+    #[test]
+    fn cli_web_search_shortcut_builds_default_hosted_tool() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+clients:
+  - type: openai
+    api_key: test-key
+"#,
+        )
+        .unwrap();
+        let config = Arc::new(RwLock::new(config));
+        let cli = Cli::try_parse_from([
+            "aichat",
+            "--show-cost",
+            "--multi-agent",
+            "--web-search",
+            "-m",
+            "openai:gpt-5.6-sol:high",
+            "perform siem systems market analysis",
+        ])
+        .unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+        let model = Model::retrieve_model(
+            &config.read(),
+            cli.model.as_deref().unwrap(),
+            ModelType::Chat,
+        )
+        .unwrap();
+        let body = build_openai_responses_multi_agent_body(
+            ChatCompletionsData {
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                include_usage: true,
+            },
+            &model,
+            &config.read().multi_agent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "type": "web_search",
+                "search_context_size": "medium",
+                "return_token_budget": "default"
+            })
+        );
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn enabled_config_builds_custom_hosted_tool_without_cli_mode_flags() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+multi_agent:
+  enabled: true
+  hosted_tools:
+    - type: web_search
+      search_context_size: low
+      external_web_access: false
+      return_token_budget: unlimited
+  tool_choice: required
+  service_tier: flex
+clients:
+  - type: openai
+    api_key: test-key
+"#,
+        )
+        .unwrap();
+        let config = Arc::new(RwLock::new(config));
+        let cli = Cli::try_parse_from([
+            "aichat",
+            "-m",
+            "openai:gpt-5.6-sol:high",
+            "perform siem systems market analysis",
+        ])
+        .unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+        let model = Model::retrieve_model(
+            &config.read(),
+            cli.model.as_deref().unwrap(),
+            ModelType::Chat,
+        )
+        .unwrap();
+        let body = build_openai_responses_multi_agent_body(
+            ChatCompletionsData {
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                include_usage: true,
+            },
+            &model,
+            &config.read().multi_agent,
+        )
+        .unwrap();
+
+        assert!(config.read().multi_agent.enabled);
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "type": "web_search",
+                "search_context_size": "low",
+                "external_web_access": false,
+                "return_token_budget": "unlimited"
+            })
+        );
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["service_tier"], "flex");
+    }
+
+    #[test]
+    fn rejects_invalid_tool_constraints() {
+        let input = || ChatCompletionsData {
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+            include_usage: false,
+        };
+        let duplicate_web = MultiAgentConfig {
+            hosted_tools: vec![
+                MultiAgentHostedTool::web_search(),
+                MultiAgentHostedTool::web_search(),
+            ],
+            ..Default::default()
+        };
+        assert!(build_openai_responses_multi_agent_body(
+            input(),
+            &responses_model(None),
+            &duplicate_web
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("at most once"));
+
+        let settings = MultiAgentConfig {
+            tool_choice: MultiAgentToolChoice::Required,
+            ..Default::default()
+        };
+        assert!(build_openai_responses_multi_agent_body(
+            input(),
+            &responses_model(None),
+            &settings
+        )
+        .is_err());
     }
 
     fn function_call(call_id: &str, name: &str, arguments: Value) -> Value {
@@ -2596,5 +3713,93 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "Aborted.");
+    }
+
+    #[tokio::test]
+    async fn preserves_completed_turn_progress_after_later_failure() {
+        let progress = OpenAIResponsesProgress::default();
+        progress.set_pricing_context(OpenAIResponsesPricingContext::PublicApi);
+        let send_count = Cell::new(0);
+
+        let error = run_multi_agent_loop_with_progress(
+            json!({"input": []}),
+            &create_abort_signal(),
+            |_| {
+                let current = send_count.get();
+                send_count.set(current + 1);
+                if current == 0 {
+                    ready(Ok(completed_response(
+                        "resp_completed",
+                        vec![function_call("call_1", "lookup", json!({}))],
+                        11,
+                        3,
+                    )))
+                } else {
+                    ready(Err(anyhow::anyhow!("second turn failed")))
+                }
+            },
+            |calls| Ok(vec![json!("DONE"); calls.len()]),
+            Some(&progress),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "second turn failed");
+        let (turns, pricing_context) = progress.snapshot();
+        assert_eq!(pricing_context, OpenAIResponsesPricingContext::PublicApi);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].response_id, "resp_completed");
+        assert_eq!(turns[0].usage.input_tokens, Some(11));
+        assert_eq!(turns[0].usage.output_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn preserves_incomplete_response_usage_and_web_search_cost() {
+        let progress = OpenAIResponsesProgress::default();
+        progress.set_pricing_context(OpenAIResponsesPricingContext::PublicApi);
+        let response = json!({
+            "id": "resp_incomplete",
+            "status": "incomplete",
+            "service_tier": "default",
+            "output": [{
+                "type": "web_search_call",
+                "action": {
+                    "type": "search",
+                    "query": "billable query",
+                    "sources": [{"type": "url", "url": "https://example.com"}]
+                }
+            }],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {
+                    "cached_tokens": 2,
+                    "cache_write_tokens": 1
+                },
+                "output_tokens": 4,
+                "output_tokens_details": {"reasoning_tokens": 3}
+            },
+            "error": null,
+            "incomplete_details": {"reason": "max_output_tokens"}
+        });
+
+        let error = run_multi_agent_loop_with_progress(
+            json!({"input": []}),
+            &create_abort_signal(),
+            |_| ready(Ok(response.clone())),
+            |_| unreachable!("incomplete responses do not execute developer tools"),
+            Some(&progress),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("was incomplete"));
+        let (turns, pricing_context) = progress.snapshot();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].usage.input_tokens, Some(10));
+        assert_eq!(billable_web_search_calls(&turns), 1);
+        let summary =
+            format_openai_responses_usage_cost(&priced_responses_model(), &turns, pricing_context);
+        assert!(summary.contains("Hosted web searches: 1 | Fee: $0.010000"));
+        assert!(summary.contains("Estimated total cost: $0.010"));
     }
 }

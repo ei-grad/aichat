@@ -1,3 +1,4 @@
+use crate::config::OpenAIServiceTier;
 use anyhow::{Context, Result};
 use clap::Parser;
 use is_terminal::IsTerminal;
@@ -42,6 +43,15 @@ pub struct Cli {
     /// Display sanitized multi-agent activity on stderr
     #[clap(long)]
     pub show_agent_trace: bool,
+    /// Enable OpenAI hosted web search in multi-agent mode
+    #[clap(long)]
+    pub web_search: bool,
+    /// Limit generated output tokens per response
+    #[clap(long, value_name = "N")]
+    pub max_output_tokens: Option<NonZeroUsize>,
+    /// Select the OpenAI processing service tier
+    #[clap(long, value_enum, value_name = "TIER")]
+    pub service_tier: Option<OpenAIServiceTier>,
     /// Start a RAG
     #[clap(long)]
     pub rag: Option<String>,
@@ -269,10 +279,18 @@ mod tests {
             "--multi-agent",
             "--max-concurrent-subagents",
             "4",
+            "--web-search",
+            "--max-output-tokens",
+            "2048",
+            "--service-tier",
+            "priority",
             "delegate",
         ]);
         assert!(cli.multi_agent);
         assert_eq!(cli.max_concurrent_subagents.map(NonZeroUsize::get), Some(4));
+        assert!(cli.web_search);
+        assert_eq!(cli.max_output_tokens.map(NonZeroUsize::get), Some(2048));
+        assert_eq!(cli.service_tier, Some(OpenAIServiceTier::Priority));
         assert_eq!(cli.text_with_stdin(""), Some("delegate".into()));
 
         let cli = parse(&["aichat", "--max-concurrent-subagents", "2"]);
@@ -282,6 +300,9 @@ mod tests {
         let cli = parse(&["aichat", "--multi-agent"]);
         assert!(cli.multi_agent);
         assert_eq!(cli.max_concurrent_subagents, None);
+        assert!(!cli.web_search);
+        assert_eq!(cli.max_output_tokens, None);
+        assert_eq!(cli.service_tier, None);
     }
 
     #[test]
@@ -298,5 +319,19 @@ mod tests {
         let err = Cli::try_parse_from(["aichat", "--max-concurrent-subagents", "0"])
             .expect_err("zero must be rejected during argument parsing");
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn rejects_zero_multi_agent_request_limits() {
+        let err = Cli::try_parse_from(["aichat", "--max-output-tokens", "0"])
+            .expect_err("zero must be rejected during argument parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn rejects_unknown_service_tier() {
+        let err = Cli::try_parse_from(["aichat", "--service-tier", "expensive"])
+            .expect_err("unknown service tier must be rejected during argument parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 }

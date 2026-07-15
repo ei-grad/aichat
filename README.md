@@ -74,20 +74,52 @@ aichat --show-cost "Explain this code"
 
 Set `show_cost: true` in the config file to enable it by default, including in the REPL. The summary is written to stderr so response text on stdout remains safe to pipe. Cost requires both usage data from the provider and input/output prices in the model catalog.
 
-For OpenAI Responses multi-agent runs, the estimate is calculated separately for each continuation request. It accounts for cached input, cache writes, the actual service tier, and GPT-5.6 long-context multipliers when those fields and prices are available. If an exact calculation is not possible, the cost is reported as unavailable instead of assuming a pricing tier. Cost is also unavailable for custom or regional OpenAI `api_base` endpoints because their pricing may differ from the public API catalog. The API reports response-level usage for the agent tree, not per-agent usage, so AIChat does not invent per-agent token or cost totals.
+For OpenAI Responses multi-agent runs, the estimate is calculated separately for each continuation request. It accounts for cached input, cache writes, the actual service tier, GPT-5.6 long-context multipliers, and billable hosted web-search actions. Search actions are charged at the cataloged $0.01 per call; page opens and in-page finds are not counted as additional searches. If an exact calculation is not possible, the cost is reported as unavailable instead of assuming a pricing tier. Cost is also unavailable for custom or regional OpenAI `api_base` endpoints because their pricing may differ from the public API catalog.
+
+The API reports response-level usage for the entire agent tree, not per-agent usage, so AIChat does not invent per-agent token or cost totals. If a later continuation request fails or the run is aborted, completed and otherwise billable response payloads are printed as partial usage before the error.
 
 ### OpenAI Responses Multi-agent
 
-GPT-5.6 models can use OpenAI's hosted multi-agent orchestration in one-shot command mode:
+GPT-5.6 models can use OpenAI's hosted multi-agent orchestration in one-shot command mode. For a research-oriented default, add this to `config.yaml`:
 
-```sh
-aichat -m openai:gpt-5.6-sol --multi-agent --show-agent-trace --show-cost \
-  "Research the alternatives in parallel and reconcile the result"
+```yaml
+multi_agent:
+  hosted_tools:
+    - type: web_search
+      search_context_size: high
+      external_web_access: true
+      return_token_budget: default
+  tool_choice: required
+  max_output_tokens: 16000
+  service_tier: default
 ```
 
-`--show-agent-trace` writes a sanitized structural trace to stderr. It shows response turns, agent paths, collaboration actions, message direction, phases, and tool names without printing encrypted messages, prompts, tool arguments, or tool results. Set `multi_agent.show_trace: true` to enable it in the config.
+Then the hosted web-search tool is available to the root agent and every subagent:
 
-Subagents receive the tools selected by `use_tools`. OpenAI hosted tools such as Responses `web_search` are not enabled automatically; a local function named `web_search` is still a developer-defined AIChat tool.
+```sh
+aichat --show-cost --multi-agent -m openai:gpt-5.6-sol:high \
+  "perform siem systems market analysis"
+```
+
+`--web-search` is a CLI shortcut that enables the default hosted web-search configuration for one run. `--max-output-tokens`, `--service-tier`, and `--max-concurrent-subagents` override their config values. OpenAI currently does not support `max_tool_calls` when multi-agent is enabled, so AIChat does not expose that control.
+
+`--show-agent-trace` writes a sanitized structural trace to stderr. It shows response turns, agent paths, collaboration actions, message direction, phases, and tool names without printing encrypted messages, prompts, tool arguments, tool results, search queries, or search results. Set `multi_agent.show_trace: true` to enable it in the config. Web citations and returned sources are rendered as a deduplicated Markdown `Sources:` list.
+
+Subagents receive both the local developer functions selected by `use_tools` and configured hosted tools. A local function named `web_search` remains distinct from the OpenAI-hosted `web_search` tool. First-class hosted tools require the canonical `https://api.openai.com/v1/responses` endpoint.
+
+Advanced transports can patch Responses requests separately from Chat Completions:
+
+```yaml
+clients:
+  - type: openai
+    patch:
+      responses:
+        'gpt-5\.6-.*':
+          headers:
+            x-example: value
+```
+
+The equivalent environment override is `AICHAT_PATCH_OPENAI_RESPONSES`. Responses patches are applied after AIChat builds the first-class body; JSON Merge Patch replaces arrays, so a patched `tools` array replaces both hosted and developer tools. See the [OpenAI multi-agent guide](https://developers.openai.com/api/docs/guides/responses-multi-agent) and [web-search guide](https://developers.openai.com/api/docs/guides/tools-web-search) for the server-side contract.
 
 ### Role
 

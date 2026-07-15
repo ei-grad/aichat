@@ -41,6 +41,7 @@ struct ModelRecord {
 struct ResponsePricingRecord {
     cached_input_price: f64,
     cache_write_input_price: f64,
+    web_search_call_price: Option<f64>,
     long_context_threshold: u64,
     long_context_input_multiplier: f64,
     long_context_output_multiplier: f64,
@@ -100,6 +101,7 @@ fn openai_gpt_5_6_models_include_response_pricing() {
 
         assert_eq!(pricing.cached_input_price, cached_price);
         assert_eq!(pricing.cache_write_input_price, write_price);
+        assert_eq!(pricing.web_search_call_price, Some(0.01));
         assert_eq!(pricing.long_context_threshold, 272_000);
         assert_eq!(pricing.long_context_input_multiplier, 2.0);
         assert_eq!(pricing.long_context_output_multiplier, 1.5);

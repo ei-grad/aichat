@@ -17,13 +17,14 @@ use crate::client::{
     call_chat_completions, call_chat_completions_streaming, format_usage_cost, list_models,
     openai_responses::{
         format_openai_responses_trace, format_openai_responses_usage_cost,
-        run_openai_responses_multi_agent, OpenAIResponsesOutput,
+        run_openai_responses_multi_agent, OpenAIResponsesOutput, OpenAIResponsesProgress,
     },
     ModelType, TokenUsage,
 };
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
-    RoleLike, WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
+    MultiAgentHostedTool, RoleLike, WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE,
+    TEMP_SESSION_NAME,
 };
 use crate::render::render_error;
 use crate::repl::Repl;
@@ -224,6 +225,17 @@ fn configure_multi_agent(config: &GlobalConfig, cli: &Cli) -> Result<()> {
             "--show-agent-trace requires multi-agent mode; enable it with --multi-agent or multi_agent.enabled"
         );
     }
+    for (is_set, option) in [
+        (cli.web_search, "--web-search"),
+        (cli.max_output_tokens.is_some(), "--max-output-tokens"),
+        (cli.service_tier.is_some(), "--service-tier"),
+    ] {
+        if is_set && !enabled {
+            bail!(
+                "{option} requires multi-agent mode; enable it with --multi-agent or multi_agent.enabled"
+            );
+        }
+    }
 
     let mut config = config.write();
     config.multi_agent.enabled = enabled;
@@ -233,7 +245,25 @@ fn configure_multi_agent(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     if cli.show_agent_trace {
         config.multi_agent.show_trace = true;
     }
-    Ok(())
+    if cli.web_search
+        && !config
+            .multi_agent
+            .hosted_tools
+            .iter()
+            .any(|tool| matches!(tool, MultiAgentHostedTool::WebSearch { .. }))
+    {
+        config
+            .multi_agent
+            .hosted_tools
+            .push(MultiAgentHostedTool::web_search());
+    }
+    if let Some(max_output_tokens) = cli.max_output_tokens {
+        config.multi_agent.max_output_tokens = Some(max_output_tokens);
+    }
+    if let Some(service_tier) = cli.service_tier {
+        config.multi_agent.service_tier = service_tier;
+    }
+    config.multi_agent.validate()
 }
 
 fn validate_multi_agent_mode(config: &GlobalConfig, cli: &Cli) -> Result<()> {
@@ -337,20 +367,34 @@ async fn run_multi_agent_directive(
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<OpenAIResponsesOutput> {
+    let model = input.role().model().clone();
+    let progress = OpenAIResponsesProgress::default();
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
-    let max_concurrent_subagents = config.read().multi_agent.max_concurrent_subagents;
     config.write().before_chat_completion(&input)?;
-    let mut output = abortable_run_with_spinner(
-        run_openai_responses_multi_agent(
-            config,
-            &input,
-            max_concurrent_subagents,
-            abort_signal.clone(),
-        ),
+    let result = abortable_run_with_spinner(
+        run_openai_responses_multi_agent(config, &input, abort_signal.clone(), progress.clone()),
         "Generating",
         abort_signal,
     )
-    .await?;
+    .await;
+    let mut output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            let (turns, pricing_context) = progress.snapshot();
+            if !turns.is_empty() {
+                if config.read().multi_agent.show_trace {
+                    eprintln!("{}", format_openai_responses_trace(&turns));
+                }
+                if config.read().show_cost {
+                    eprintln!(
+                        "Partial Responses usage before failure:\n{}",
+                        format_openai_responses_usage_cost(&model, &turns, pricing_context)
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
     if config.read().multi_agent.show_trace && !output.turns.is_empty() {
         eprintln!("{}", format_openai_responses_trace(&output.turns));
     }
@@ -538,6 +582,8 @@ fn setup_logger(is_serve: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{HostedWebSearchConfig, OpenAIServiceTier, WebSearchContextSize};
+    use std::num::NonZeroUsize;
 
     #[tokio::test]
     async fn list_command_returns_before_info_prelude() {
@@ -597,6 +643,54 @@ mod tests {
     }
 
     #[test]
+    fn cli_enables_web_search_and_request_controls() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let cli = Cli::try_parse_from([
+            "aichat",
+            "--multi-agent",
+            "--web-search",
+            "--max-output-tokens",
+            "16000",
+            "--service-tier",
+            "default",
+            "prompt",
+        ])
+        .unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+
+        let config = config.read();
+        assert!(config.multi_agent.enabled);
+        assert_eq!(config.multi_agent.hosted_tools.len(), 1);
+        assert_eq!(
+            config.multi_agent.max_output_tokens.map(NonZeroUsize::get),
+            Some(16_000)
+        );
+        assert_eq!(config.multi_agent.service_tier, OpenAIServiceTier::Default);
+    }
+
+    #[test]
+    fn cli_multi_agent_preserves_configured_web_search_without_duplication() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        config.write().multi_agent.hosted_tools = vec![MultiAgentHostedTool::WebSearch {
+            config: HostedWebSearchConfig {
+                search_context_size: WebSearchContextSize::High,
+                ..Default::default()
+            },
+        }];
+        let cli =
+            Cli::try_parse_from(["aichat", "--multi-agent", "--web-search", "prompt"]).unwrap();
+
+        configure_multi_agent(&config, &cli).unwrap();
+
+        let config = config.read();
+        assert!(config.multi_agent.enabled);
+        assert_eq!(config.multi_agent.hosted_tools.len(), 1);
+        let MultiAgentHostedTool::WebSearch { config } = &config.multi_agent.hosted_tools[0];
+        assert_eq!(config.search_context_size, WebSearchContextSize::High);
+    }
+
+    #[test]
     fn concurrency_limit_requires_multi_agent_mode() {
         let config = Arc::new(RwLock::new(Config::default()));
         let cli =
@@ -619,6 +713,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--show-agent-trace requires multi-agent mode"));
+    }
+
+    #[test]
+    fn hosted_request_controls_require_multi_agent_mode() {
+        for args in [
+            vec!["aichat", "--web-search", "prompt"],
+            vec!["aichat", "--max-output-tokens", "1024", "prompt"],
+            vec!["aichat", "--service-tier", "flex", "prompt"],
+        ] {
+            let config = Arc::new(RwLock::new(Config::default()));
+            let cli = Cli::try_parse_from(args).unwrap();
+
+            assert!(configure_multi_agent(&config, &cli)
+                .unwrap_err()
+                .to_string()
+                .contains("requires multi-agent mode"));
+        }
     }
 
     #[test]

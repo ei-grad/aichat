@@ -1,5 +1,5 @@
 use super::{
-    list_all_models, list_client_names,
+    client_allows_raw_reasoning_suffix, list_all_models, list_client_names,
     message::{Message, MessageContent, MessageContentPart},
     ApiPatch, MessageContentToolCalls, RequestPatch, TokenUsage,
 };
@@ -90,7 +90,9 @@ impl Model {
                         bail!("Model '{model_id}' is not a {model_type} model")
                     }
                 }
-                validate_reasoning_effort(&models, client_name, model_name)?;
+                if !client_allows_raw_reasoning_suffix(config, client_name) {
+                    validate_reasoning_effort(&models, client_name, model_name)?;
+                }
                 if list_client_names(config)
                     .into_iter()
                     .any(|v| *v == client_name)
@@ -342,7 +344,9 @@ pub(super) fn validate_reasoning_effort(
     }
     let base_id = format!("{client_name}:{base_name}");
     let Some(base) = models.iter().find(|model| model.id() == base_id) else {
-        return Ok(());
+        bail!(
+            "Model '{base_id}' is not cataloged; configure its reasoning_efforts before using effort '{effort}'"
+        );
     };
     let supported = &base.data.reasoning_efforts;
     if supported.iter().any(|supported| supported == effort) {
@@ -492,6 +496,8 @@ pub struct ModelData {
 pub struct ResponsePricing {
     pub cached_input_price: f64,
     pub cache_write_input_price: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_call_price: Option<f64>,
     pub long_context_threshold: u64,
     pub long_context_input_multiplier: f64,
     pub long_context_output_multiplier: f64,
@@ -505,6 +511,71 @@ impl ModelData {
             model_type: default_model_type(),
             ..Default::default()
         }
+    }
+
+    pub(crate) fn with_catalog_metadata_defaults(&self, defaults: &Self) -> Self {
+        let mut merged = self.clone();
+        match (&mut merged.response_pricing, &defaults.response_pricing) {
+            (Some(merged_pricing), Some(default_pricing)) => {
+                merged_pricing.web_search_call_price = merged_pricing
+                    .web_search_call_price
+                    .or(default_pricing.web_search_call_price);
+            }
+            (None, Some(default_pricing)) => {
+                merged.response_pricing = Some(default_pricing.clone());
+            }
+            _ => {}
+        }
+        // Serde maps both an omitted list and `reasoning_efforts: []` to an empty Vec,
+        // so the current catalog format cannot express deletion of bundled efforts.
+        if merged.reasoning_efforts.is_empty() {
+            merged.reasoning_efforts = defaults.reasoning_efforts.clone();
+        }
+        merged
+    }
+
+    pub(crate) fn with_catalog_defaults(&self, defaults: &Self) -> Self {
+        let mut merged = self.with_catalog_metadata_defaults(defaults);
+        merged.real_name = merged.real_name.or_else(|| defaults.real_name.clone());
+        merged.max_input_tokens = merged.max_input_tokens.or(defaults.max_input_tokens);
+        merged.input_price = merged.input_price.or(defaults.input_price);
+        merged.output_price = merged.output_price.or(defaults.output_price);
+        if let (Some(merged_pricing), Some(default_pricing)) =
+            (&mut merged.response_pricing, &defaults.response_pricing)
+        {
+            for (tier, multiplier) in &default_pricing.service_tier_multipliers {
+                merged_pricing
+                    .service_tier_multipliers
+                    .entry(tier.clone())
+                    .or_insert(*multiplier);
+            }
+        }
+        merged.patch = merged.patch.or_else(|| defaults.patch.clone());
+        merged.max_output_tokens = merged.max_output_tokens.or(defaults.max_output_tokens);
+        merged.system_prompt_prefix = merged
+            .system_prompt_prefix
+            .or_else(|| defaults.system_prompt_prefix.clone());
+        merged.max_tokens_per_chunk = merged
+            .max_tokens_per_chunk
+            .or(defaults.max_tokens_per_chunk);
+        merged.default_chunk_size = merged.default_chunk_size.or(defaults.default_chunk_size);
+        merged.max_batch_size = merged.max_batch_size.or(defaults.max_batch_size);
+        merged
+    }
+
+    pub(crate) fn with_catalog_capabilities(&self, defaults: &Self) -> Self {
+        let mut merged = self.with_catalog_defaults(defaults);
+        for effort in &defaults.reasoning_efforts {
+            if !merged.reasoning_efforts.contains(effort) {
+                merged.reasoning_efforts.push(effort.clone());
+            }
+        }
+        merged.require_max_tokens |= defaults.require_max_tokens;
+        merged.supports_vision |= defaults.supports_vision;
+        merged.supports_function_calling |= defaults.supports_function_calling;
+        merged.no_stream |= defaults.no_stream;
+        merged.no_system_message |= defaults.no_system_message;
+        merged
     }
 }
 

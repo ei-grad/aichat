@@ -25,6 +25,19 @@ multi_agent:
   enabled: false
   max_concurrent_subagents: null # Optional positive concurrency limit when enabled
   show_trace: false              # Display sanitized agent activity on stderr
+  # Hosted Responses API tools. To enable web search, replace the empty list with:
+  # hosted_tools:
+  #   - type: web_search
+  #     search_context_size: medium # low, medium, or high
+  #     external_web_access: null   # null uses the API default (live access enabled)
+  #     return_token_budget: default # default or unlimited
+  #     filters:
+  #       allowed_domains: []
+  #       blocked_domains: []
+  hosted_tools: []
+  tool_choice: auto              # auto or required
+  max_output_tokens: null        # Optional positive output-token limit
+  service_tier: auto             # auto, default, flex, or priority
 
 # ---- prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
@@ -91,7 +104,7 @@ serve_addr: 127.0.0.1:8000                  # Server listening address
 user_agent: null                            # Set User-Agent HTTP header, use `auto` for aichat/<current-version>
 save_shell_history: true                    # Whether to save shell execution command to the history file
 # URL to sync model changes from, e.g., https://cdn.jsdelivr.net/gh/sigoden/aichat@main/models.yaml
-sync_models_url: https://raw.githubusercontent.com/sigoden/aichat/refs/heads/main/models.yaml
+sync_models_url: https://raw.githubusercontent.com/ei-grad/aichat/refs/heads/main/models.yaml
 
 # ---- clients ----
 clients:
@@ -110,7 +123,7 @@ clients:
   #     - name: xxxx                                  # Reranker model
   #       type: reranker 
   #   patch:                                          # Patch api
-  #     chat_completions:                             # Api type, possible values: chat_completions, embeddings, and rerank
+  #     chat_completions:                             # Api type: chat_completions, responses, embeddings, or rerank
   #       <regex>:                                    # The regex to match model names, e.g. '.*' 'gpt-4o' 'gpt-4o|gpt-4-.*'
   #         url: ''                                   # Patch request url
   #         body:                                     # Patch request body
