@@ -1286,6 +1286,32 @@ pub fn format_openai_responses_live_progress(
         .last_event_at
         .map(|last_event_at| now.saturating_duration_since(last_event_at))
         .unwrap_or(elapsed);
+    let mut output = format!(
+        "{} {}",
+        format_elapsed(elapsed),
+        compact_live_activity(snapshot)
+    );
+    if let Some(agent_name) = compact_live_agent(snapshot.agent_name.as_deref()) {
+        let _ = write!(output, " {agent_name}");
+    }
+    if idle >= Duration::from_secs(2) {
+        let _ = write!(output, " idle:{}s", idle.as_secs());
+    }
+    output
+}
+
+pub fn format_openai_responses_live_debug_progress(
+    snapshot: &OpenAIResponsesLiveSnapshot,
+    now: std::time::Instant,
+) -> String {
+    let elapsed = snapshot
+        .started_at
+        .map(|started_at| now.saturating_duration_since(started_at))
+        .unwrap_or_default();
+    let idle = snapshot
+        .last_event_at
+        .map(|last_event_at| now.saturating_duration_since(last_event_at))
+        .unwrap_or(elapsed);
     let mut output = format!("Generating {}", format_elapsed(elapsed));
     if let Some(event_type) = &snapshot.event_type {
         let _ = write!(output, " | last={}", sanitize_display(event_type, 80));
@@ -1312,6 +1338,66 @@ pub fn format_openai_responses_live_progress(
         let _ = write!(output, " | idle={}s", idle.as_secs());
     }
     output
+}
+
+fn compact_live_activity(snapshot: &OpenAIResponsesLiveSnapshot) -> String {
+    let event_type = snapshot.event_type.as_deref().unwrap_or("working");
+    match event_type {
+        "connecting" => "connect".to_string(),
+        "stream.open" => "connected".to_string(),
+        "response.created" => "created".to_string(),
+        "response.in_progress" => "working".to_string(),
+        "response.completed" => "done".to_string(),
+        "response.failed" | "error" => "failed".to_string(),
+        "response.incomplete" => "incomplete".to_string(),
+        "response.web_search_call.in_progress" => "web:start".to_string(),
+        "response.web_search_call.searching" => "web:search".to_string(),
+        "response.web_search_call.completed" => "web:done".to_string(),
+        "response.output_text.delta" | "response.output_text.done" => "writing".to_string(),
+        "response.output_item.added" | "response.output_item.done" => snapshot
+            .action
+            .as_deref()
+            .map(compact_live_action)
+            .or_else(|| snapshot.item_type.as_deref().map(compact_live_item))
+            .unwrap_or_else(|| "working".to_string()),
+        value if value.contains("reasoning") => "thinking".to_string(),
+        value if value.starts_with("response.content_part.") => "writing".to_string(),
+        value => sanitize_display(value.rsplit('.').next().unwrap_or(value), 18),
+    }
+}
+
+fn compact_live_action(action: &str) -> String {
+    match action {
+        "spawn_agent" => "spawn".to_string(),
+        "send_message" => "message".to_string(),
+        "followup_task" => "followup".to_string(),
+        "wait" | "wait_agent" => "wait".to_string(),
+        "list_agents" => "agents".to_string(),
+        "interrupt_agent" => "interrupt".to_string(),
+        value => sanitize_display(value, 18),
+    }
+}
+
+fn compact_live_item(item_type: &str) -> String {
+    match item_type {
+        "multi_agent_call" => "agent".to_string(),
+        "multi_agent_call_output" => "agent:done".to_string(),
+        "agent_message" => "agent:msg".to_string(),
+        "message" => "writing".to_string(),
+        "web_search_call" => "web".to_string(),
+        "reasoning" => "thinking".to_string(),
+        "function_call" => "tool".to_string(),
+        value => sanitize_display(value, 18),
+    }
+}
+
+fn compact_live_agent(agent_name: Option<&str>) -> Option<String> {
+    let agent_name = agent_name?;
+    if agent_name == ROOT_AGENT {
+        return None;
+    }
+    let agent_name = agent_name.strip_prefix("/root/").unwrap_or(agent_name);
+    Some(sanitize_display(agent_name, 20))
 }
 
 fn format_elapsed(duration: Duration) -> String {
@@ -4047,7 +4133,7 @@ responses:
     }
 
     #[test]
-    fn live_progress_formatter_is_bounded_and_reports_heartbeat_state() {
+    fn live_progress_formatter_is_compact_and_keeps_debug_details_separate() {
         let now = std::time::Instant::now();
         let snapshot = OpenAIResponsesLiveSnapshot {
             started_at: Some(now - Duration::from_secs(65)),
@@ -4062,14 +4148,39 @@ responses:
         };
 
         let formatted = format_openai_responses_live_progress(&snapshot, now);
+        let debug = format_openai_responses_live_debug_progress(&snapshot, now);
 
-        assert!(formatted.contains("Generating 01:05"));
-        assert!(formatted.contains("idle=3s"));
-        assert!(formatted.contains("seq=42"));
-        assert!(formatted.contains("output=3"));
+        assert_eq!(formatted, "01:05 thinking researcher idle:3s");
+        for detail in ["resp_", "seq=", "output=", "item="] {
+            assert!(!formatted.contains(detail));
+        }
         assert!(!formatted.contains('\n'));
         assert!(!formatted.contains('\u{001b}'));
-        assert!(formatted.len() < 360);
+        assert!(formatted.len() < 60);
+        assert!(debug.contains("Generating 01:05"));
+        assert!(debug.contains("seq=42"));
+        assert!(debug.contains("output=3"));
+    }
+
+    #[test]
+    fn live_progress_formatter_compacts_web_search_status() {
+        let now = std::time::Instant::now();
+        let snapshot = OpenAIResponsesLiveSnapshot {
+            started_at: Some(now - Duration::from_secs(3)),
+            last_event_at: Some(now),
+            response_id: Some("resp_0983eeb8e0ae9d77016a57efc117b481".to_string()),
+            event_type: Some("response.web_search_call.searching".to_string()),
+            sequence_number: Some(12),
+            output_index: Some(1),
+            item_type: Some("web_search_call".to_string()),
+            agent_name: Some("/root/search1".to_string()),
+            action: None,
+        };
+
+        assert_eq!(
+            format_openai_responses_live_progress(&snapshot, now),
+            "00:03 web:search search1"
+        );
     }
 
     #[tokio::test]

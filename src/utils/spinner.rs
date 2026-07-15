@@ -5,6 +5,7 @@ use crossterm::{cursor, queue, style, terminal};
 use std::{
     future::Future,
     io::{stderr, stdout, Write},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use tokio::{
@@ -14,6 +15,18 @@ use tokio::{
     },
     time::interval,
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+static SPINNERS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_spinners_enabled(enabled: bool) {
+    SPINNERS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn spinners_enabled() -> bool {
+    SPINNERS_ENABLED.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Default)]
 pub struct SpinnerInner {
@@ -25,16 +38,24 @@ impl SpinnerInner {
     const DATA: [&'static str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
     fn step(&mut self) -> Result<()> {
-        if !*IS_STDOUT_TERMINAL || self.message.is_empty() {
+        if !spinners_enabled() || !*IS_STDOUT_TERMINAL || self.message.is_empty() {
             return Ok(());
         }
         let mut writer = stdout();
         let frame = Self::DATA[self.index % Self::DATA.len()];
-        let dots = ".".repeat((self.index / 5) % 4);
-        let line = format!("{frame}{}{:<3}", self.message, dots);
-        queue!(writer, cursor::MoveToColumn(0), style::Print(line),)?;
-        if self.index == 0 {
-            queue!(writer, cursor::Hide)?;
+        let line = match terminal::size() {
+            Ok((columns, _)) => format_spinner_line(frame, &self.message, columns),
+            Err(_) => String::new(),
+        };
+        queue!(
+            writer,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::CurrentLine)
+        )?;
+        if !line.is_empty() {
+            queue!(writer, style::Print(line), cursor::Hide)?;
+        } else {
+            queue!(writer, cursor::Show)?;
         }
         writer.flush()?;
         self.index += 1;
@@ -58,7 +79,7 @@ impl SpinnerInner {
         queue!(
             writer,
             cursor::MoveToColumn(0),
-            terminal::Clear(terminal::ClearType::FromCursorDown),
+            terminal::Clear(terminal::ClearType::CurrentLine),
             cursor::Show
         )?;
         writer.flush()?;
@@ -94,6 +115,9 @@ impl Spinner {
     }
 
     pub fn set_message(&self, message: String) -> Result<()> {
+        if !spinners_enabled() {
+            return Ok(());
+        }
         self.0.send(SpinnerEvent::SetMessage(message))?;
         std::thread::sleep(Duration::from_millis(10));
         Ok(())
@@ -108,6 +132,46 @@ impl Spinner {
         self.0.send(SpinnerEvent::PrintLine(line))?;
         Ok(())
     }
+}
+
+fn format_spinner_line(frame: &str, message: &str, terminal_columns: u16) -> String {
+    let max_width = usize::from(terminal_columns.saturating_sub(1));
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(frame) >= max_width {
+        return truncate_display_width(frame, max_width, false);
+    }
+    truncate_display_width(&format!("{frame}{message}"), max_width, true)
+}
+
+fn truncate_display_width(value: &str, max_width: usize, mark_truncation: bool) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(value) <= max_width {
+        return value.to_string();
+    }
+    let marker_width = usize::from(mark_truncation);
+    let content_width = max_width.saturating_sub(marker_width);
+    let mut output = String::new();
+    let mut width = 0usize;
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width > content_width {
+            break;
+        }
+        output.push_str(grapheme);
+        width += grapheme_width;
+    }
+    if mark_truncation {
+        output.push('~');
+    }
+    output
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value).max(UnicodeWidthStr::width_cjk(value))
 }
 
 pub enum SpinnerEvent {
@@ -237,4 +301,40 @@ async fn run_abortable_spinner(
 
     spinner.clear_message()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spinner_line_never_reaches_the_terminal_wrap_column() {
+        assert_eq!(format_spinner_line("⠋", " status", 0), "");
+        for columns in [1, 2, 10, 20, 80] {
+            let line = format_spinner_line(
+                "⠋",
+                " Generating 00:03 · web search · /root/searcher",
+                columns,
+            );
+            assert!(display_width(&line) < usize::from(columns));
+        }
+    }
+
+    #[test]
+    fn spinner_line_truncates_at_grapheme_boundaries() {
+        let message = " Кириллица 👩‍💻 e\u{301} 中文 status";
+        let line = format_spinner_line("⠋", message, 16);
+
+        assert!(display_width(&line) < 16);
+        assert!(line.ends_with('~'));
+        assert!(!line.ends_with('\u{200d}'));
+        assert!(!line.ends_with('\u{301}'));
+    }
+
+    #[test]
+    fn spinner_line_keeps_full_text_when_it_fits() {
+        assert_eq!(format_spinner_line("⠋", " ready", 20), "⠋ ready");
+        assert_eq!(format_spinner_line("⠋", " long", 2), "⠋");
+        assert_eq!(format_spinner_line("⠋", " long", 1), "");
+    }
 }

@@ -16,9 +16,9 @@ use crate::cli::Cli;
 use crate::client::{
     call_chat_completions, call_chat_completions_streaming, format_usage_cost, list_models,
     openai_responses::{
-        format_openai_responses_live_progress, format_openai_responses_usage_cost,
-        run_openai_responses_multi_agent, OpenAIResponsesLiveTraceEvent, OpenAIResponsesOutput,
-        OpenAIResponsesProgress,
+        format_openai_responses_live_debug_progress, format_openai_responses_live_progress,
+        format_openai_responses_usage_cost, run_openai_responses_multi_agent,
+        OpenAIResponsesLiveTraceEvent, OpenAIResponsesOutput, OpenAIResponsesProgress,
     },
     ModelType, TokenUsage,
 };
@@ -48,6 +48,7 @@ use std::{
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
+    set_spinners_enabled(!cli.no_spinner);
     let text = cli.text()?;
     let working_mode = if cli.serve.is_some() {
         WorkingMode::Serve
@@ -426,10 +427,8 @@ async fn run_multi_agent_directive(
                 }
                 _ = heartbeat.tick() => {
                     let now = Instant::now();
-                    let message = format_openai_responses_live_progress(
-                        &progress.live_snapshot(),
-                        now,
-                    );
+                    let snapshot = progress.live_snapshot();
+                    let message = format_openai_responses_live_progress(&snapshot, now);
                     if !debug_logs_to_stderr && *IS_STDOUT_TERMINAL {
                         spinner.set_message(message.clone())?;
                     }
@@ -438,7 +437,9 @@ async fn run_multi_agent_directive(
                         None => true,
                     };
                     if should_log_heartbeat {
-                        debug!("OpenAI Responses heartbeat: {message}");
+                        let debug_message =
+                            format_openai_responses_live_debug_progress(&snapshot, now);
+                        debug!("OpenAI Responses heartbeat: {debug_message}");
                         last_debug_heartbeat = Some(now);
                     }
                 }

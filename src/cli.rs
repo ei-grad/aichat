@@ -84,6 +84,9 @@ pub struct Cli {
     /// Turn off stream mode
     #[clap(short = 'S', long)]
     pub no_stream: bool,
+    /// Disable animated terminal spinners
+    #[clap(long)]
+    pub no_spinner: bool,
     /// Display token usage and estimated cost after the response
     #[clap(long)]
     pub show_cost: bool,
@@ -270,6 +273,16 @@ mod tests {
         let cli = parse(&["aichat", "--show-cost", "hello"]);
         assert!(cli.show_cost);
         assert_eq!(cli.text_with_stdin(""), Some("hello".into()));
+    }
+
+    #[test]
+    fn parses_no_spinner_flag() {
+        let cli = parse(&["aichat", "--no-spinner", "hello"]);
+        assert!(cli.no_spinner);
+        assert_eq!(cli.text_with_stdin(""), Some("hello".into()));
+
+        let cli = parse(&["aichat", "hello"]);
+        assert!(!cli.no_spinner);
     }
 
     #[test]
